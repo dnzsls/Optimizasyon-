@@ -1,0 +1,222 @@
+# ===========================
+# INBOUND PLAN (pyworkforce + PuLP) — GÜNCEL
+# ===========================
+import pandas as pd
+from math import ceil
+from pulp import LpProblem, LpMinimize, LpVariable, LpBinary, LpInteger, lpSum, PULP_CBC_CMD, LpStatus
+from pyworkforce.queuing import ErlangC
+
+# -------- 0) Global parametreler --------
+SL_TGT       = {"A": 0.80, "B": 0.80}
+ASA_MIN      = {"A": 0.5,  "B": 0.5}     # 30 sn
+AHT_MIN      = {"A": 3.0,  "B": 3.0}     # 180 sn
+INTERVAL_MIN = 15
+MAX_OCC      = 0.90
+W_UNDER, W_OVER = 3.0, 1.0               # under daha pahalı
+
+# -------- Yardımcı: 15 dk → 30 dk toplama --------
+def to_30min(df_15: pd.DataFrame) -> pd.DataFrame:
+    g = df_15.copy()
+    g["interval_30"] = (g["interval_start_min"] // 30) * 30
+    out = (g.groupby(["date","queue","interval_30"], as_index=False)["arrivals"]
+             .sum()
+             .rename(columns={"interval_30":"interval_start_min"}))
+    return out
+
+# -------- 1) pyworkforce ile 'required' hesapla --------
+def required_positions_pywf(transactions: int, aht_min: float, asa_min: float,
+                            interval_min: int = 15, sl_target: float = 0.80,
+                            max_occupancy: float = 0.90, shrinkage: float = 0.0) -> int:
+    er = ErlangC(
+        transactions=int(transactions),
+        asa=asa_min,
+        aht=aht_min,
+        interval=interval_min,
+        shrinkage=shrinkage  # burada 0 gir, toplam için sonradan / (1-s)
+    )
+    return er.required_positions(service_level=sl_target, max_occupancy=max_occupancy)
+
+def compute_required_df(df_forecast: pd.DataFrame, shrinkage: float = 0.0) -> dict:
+    """
+    Girdi: df_forecast[date, interval_start_min, queue in {'A','B'}, arrivals]
+    Çıktı: {(t,q) -> required (integer)}
+    """
+    req = {}
+    for _, r in df_forecast.iterrows():
+        t, q, calls = int(r["interval_start_min"]), r["queue"], float(r["arrivals"])
+        n = required_positions_pywf(
+            transactions=calls,
+            aht_min=AHT_MIN[q],
+            asa_min=ASA_MIN[q],
+            interval_min=INTERVAL_MIN,
+            sl_target=SL_TGT[q],
+            max_occupancy=MAX_OCC,
+            shrinkage=0.0,           # net
+        )
+        # shrinkage istenirse brüte çevir:
+        if shrinkage > 0:
+            n = ceil(n / (1 - shrinkage))
+        req[(t, q)] = n
+    return req
+
+# -------- 2A) ILP — BİREYSEL AJANS MODU --------
+def assign_multiskill_agents(df_forecast: pd.DataFrame,
+                             df_agents: pd.DataFrame,
+                             is_weekend: bool,
+                             plan_site: str = "Y"):
+    """
+    df_agents: [agent_id, site in {'Y','O'}, skills (set({'A','B'})), can_weekend {0,1}]
+    - Hafta içi: B→A DESTEK AÇIK, A→B KAPALI
+    - Hafta sonu: CROSS KAPALI (A sadece A, B sadece B)
+    - Sadece plan_site (Y) ajans inbound'a alınır; O (outbound) hariç.
+    """
+    intervals = sorted(df_forecast["interval_start_min"].unique())
+    queues    = ["A","B"]
+
+    # inbound havuz
+    df_inb = df_agents[df_agents["site"] == plan_site].copy()
+    agents = df_inb["agent_id"].tolist()
+    skillmap = {row.agent_id: row.skills for _, row in df_inb.iterrows()}
+
+    # ihtiyaç
+    req = compute_required_df(df_forecast)
+
+    m = LpProblem("MultiSkill_Assignment_Agents", LpMinimize)
+
+    # x[a,t,q] (0/1)
+    x = {(a,t,q): LpVariable(f"x_{a}_{t}_{q}", 0, 1, LpBinary)
+         for a in agents for t in intervals for q in queues}
+
+    # under/over
+    under = {(t,q): LpVariable(f"under_{t}_{q}", lowBound=0) for t in intervals for q in queues}
+    over  = {(t,q): LpVariable(f"over_{t}_{q}",  lowBound=0) for t in intervals for q in queues}
+
+    # Aynı anda tek iş
+    for a in agents:
+        for t in intervals:
+            m += lpSum(x[(a,t,q)] for q in queues) <= 1
+
+    # Yetkinlik + cross kuralları
+    for a in agents:
+        S = skillmap[a]
+        for t in intervals:
+            if is_weekend:
+                if "A" not in S: m += x[(a,t,"A")] == 0
+                if "B" not in S: m += x[(a,t,"B")] == 0
+            else:
+                # Hafta içi: B→A destek AÇIK; A→B KAPALI
+                if "B" not in S: m += x[(a,t,"B")] == 0
+                if ("A" not in S) and ("B" not in S): m += x[(a,t,"A")] == 0
+                # Sadece B yetkiliyse A'da çalışmasına izin var (B→A)
+
+    # İhtiyaç dengeleme
+    for t in intervals:
+        for q in queues:
+            planned = lpSum(x[(a,t,q)] for a in agents)
+            m += planned - req.get((t,q), 0) == over[(t,q)] - under[(t,q)]
+
+    # Basit mola kısıtları (09:15–10:30 1 slot, 12:00–14:30 3 slot, 15:45–16:30 1 slot BOŞ)
+    def rng(s,e): return [mi for mi in intervals if s <= mi < e]
+    firstB = rng(9*60+15, 10*60+30)
+    lunchB = rng(12*60,   14*60+30)
+    lastB  = rng(15*60+45,16*60+30)
+    for a in agents:
+        m += lpSum(x[(a,t,'A')]+x[(a,t,'B')] for t in firstB) <= max(len(firstB)-1, 0)
+        m += lpSum(x[(a,t,'A')]+x[(a,t,'B')] for t in lunchB) <= max(len(lunchB)-3, 0)
+        m += lpSum(x[(a,t,'A')]+x[(a,t,'B')] for t in lastB)  <= max(len(lastB)-1, 0)
+
+    # Amaç
+    m += lpSum(W_UNDER*under[(t,q)] + W_OVER*over[(t,q)] for t in intervals for q in queues)
+
+    status = m.solve(PULP_CBC_CMD(msg=False))
+    print("Solve (agents):", LpStatus[status])
+
+    # Çıktılar
+    asg = []
+    for a in agents:
+        for t in intervals:
+            for q in queues:
+                if x[(a,t,q)].value() >= 0.9:
+                    asg.append({"agent": a, "t": t, "queue": q})
+    df_assign = pd.DataFrame(asg)
+
+    cov = []
+    for t in intervals:
+        for q in queues:
+            cov.append({
+                "t": t, "queue": q,
+                "required": req.get((t,q), 0),
+                "planned": df_assign[(df_assign.t==t) & (df_assign.queue==q)].shape[0],
+                "under": under[(t,q)].value(),
+                "over":  over[(t,q)].value()
+            })
+    df_coverage = pd.DataFrame(cov)
+    return df_assign, df_coverage, req
+
+# -------- 2B) ILP — SADECE SAYI MODU (agent listesi yoksa) --------
+def assign_with_counts(df_forecast: pd.DataFrame,
+                       avail_counts: pd.DataFrame,
+                       is_weekend: bool):
+    """
+    avail_counts: [interval_start_min, A_max, B_max]
+      - Hafta içi: B→A destek AÇIK olduğu için, A kapsaması A_max + (isteğe bağlı) B'den gelen pay ile artırılabilir.
+      - Hafta sonu: cross KAPALI. Bu modelde cross'u şu şekilde yakalarız:
+          * weekend: n_A[t] ≤ A_max[t]; n_B[t] ≤ B_max[t]
+          * weekday (opsiyon 1 - basit): n_B[t] ≤ B_max[t], n_A[t] ≤ A_max[t] + B_max[t]
+            (B ajanlarının bir kısmı A'ya kaydırılabilir; istenirse kısıtla)
+    """
+    intervals = sorted(df_forecast["interval_start_min"].unique())
+    queues    = ["A","B"]
+    req = compute_required_df(df_forecast)
+
+    # İndeksle
+    caps = {int(r["interval_start_min"]): {"A": int(r["A_max"]), "B": int(r["B_max"])}
+            for _, r in avail_counts.iterrows()}
+
+    m = LpProblem("Assignment_With_Counts", LpMinimize)
+
+    # n[t,q] = o intervalde o kuyruğa koyacağımız ajan sayısı (tamsayı)
+    n = {(t,q): LpVariable(f"n_{t}_{q}", lowBound=0, cat=LpInteger) for t in intervals for q in queues}
+    under = {(t,q): LpVariable(f"under_{t}_{q}", lowBound=0) for t in intervals for q in queues}
+    over  = {(t,q): LpVariable(f"over_{t}_{q}",  lowBound=0) for t in intervals for q in queues}
+
+    # Kapasiteler
+    for t in intervals:
+        A_cap = caps.get(t, {"A":0,"B":0})["A"]
+        B_cap = caps.get(t, {"A":0,"B":0})["B"]
+
+        if is_weekend:
+            # cross yok
+            m += n[(t,"A")] <= A_cap
+            m += n[(t,"B")] <= B_cap
+        else:
+            # Hafta içi: B→A destek AÇIK (basit sürüm)
+            # A'ya konabilecek max = A_cap + B_cap (B'den A'ya kaydırılabilir)
+            # B'ye konabilecek max = B_cap (A→B yok)
+            m += n[(t,"A")] <= A_cap + B_cap
+            m += n[(t,"B")] <= B_cap
+            # İstersen A tarafına kaydırılan B ajanlarının toplamını ayrıca sınırlayan bir kısıt ekleyebiliriz.
+
+    # İhtiyaç dengeleme
+    for t in intervals:
+        for q in queues:
+            m += n[(t,q)] - req.get((t,q), 0) == over[(t,q)] - under[(t,q)]
+
+    # Amaç
+    m += lpSum(W_UNDER*under[(t,q)] + W_OVER*over[(t,q)] for t in intervals for q in queues)
+
+    status = m.solve(PULP_CBC_CMD(msg=False))
+    print("Solve (counts):", LpStatus[status])
+
+    rows = []
+    for t in intervals:
+        for q in queues:
+            rows.append({
+                "t": t, "queue": q,
+                "required": req.get((t,q), 0),
+                "planned": n[(t,q)].value(),
+                "under": under[(t,q)].value(),
+                "over":  over[(t,q)].value()
+            })
+    df_coverage = pd.DataFrame(rows)
+    return df_coverage, req
