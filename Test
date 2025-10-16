@@ -19,7 +19,7 @@ GUNLER_HAFTA = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz']
 HAFTA_SAYISI = 4
 PLANLAMA_PERIYODU = [(h, g) for h in range(1, HAFTA_SAYISI + 1) for g in GUNLER_HAFTA]
 
-# Hafta Sonu İndeksleri (Kısıt 4 ve Kısıt 5 için kullanılıyor)
+# Hafta Sonu Tanımı
 HAFTA_SONU = ['Cmt', 'Paz']
 
 # DEMAND_STAFF (Vardiya/gün başına gerekli minimum personel sayısı)
@@ -46,8 +46,12 @@ model = LpProblem("Bireysel_Calisan_Rostering", LpMinimize)
 # 3. KARAR DEĞİŞKENLERİ
 # ----------------------------------------------------
 
-# X[calisan][vardiya][hafta][gün]: i çalışanı, v vardiyasında, h haftasında, g gününde çalışırsa 1, yoksa 0 (BINARY)
+# X[calisan][vardiya][hafta][gün]: Binary atama değişkeni
 X = LpVariable.dicts("Atama", (TUM_CALISANLAR, VARDİYALAR, range(1, HAFTA_SAYISI + 1), GUNLER_HAFTA), cat=LpBinary)
+
+# Y[calisan][hafta]: Çalışanın o haftasonu çalışıp çalışmadığını gösteren yardımcı değişken (Düzeltildi)
+Y = LpVariable.dicts("HS_Calisma", (TUM_CALISANLAR, range(1, HAFTA_SAYISI + 1)), cat=LpBinary)
+
 
 # ----------------------------------------------------
 # 4. AMAÇ FONKSİYONU
@@ -105,16 +109,12 @@ for c in TUM_CALISANLAR:
 
 # Kısıt 4: Aylık Haftasonu Kısıtı (Bir çalışan ayda en az bir Haftasonu tamamen izinli olmalı)
 for c in TUM_CALISANLAR:
-    # Her hafta sonu çalışıp çalışmadığını gösteren yardımcı binary değişkenler (Y)
-    Y = LpVariable.dicts("HS_Calisma", (c, range(1, HAFTA_SAYISI + 1)), cat=LpBinary)
-
     for h in range(1, HAFTA_SAYISI + 1):
         # O haftasonu atanan toplam vardiya sayısı (Cmt ve Paz toplamı)
         haftasonu_vardiya_sayisi = lpSum([X[c][v][h][g] for v in VARDİYALAR for g in HAFTA_SONU])
 
         # Eğer haftasonu vardiya sayısı >= 1 ise (çalışma varsa), Y[c,h]=1 olmalıdır.
         # Bu kısıt, Y'nin tanımını kurar: Eğer toplam vardiya > 0 ise, Y=1'dir.
-        # Yüksek katsayı (2, Haftasonu gün sayısı) kullanarak kısıt oluşturulur.
         model += haftasonu_vardiya_sayisi <= len(HAFTA_SONU) * Y[c, h], f"Kisit_HS_Calisma_Yukari_{c}_{h}"
         
     # Asıl Kısıt: Ayda en fazla (HAFTA_SAYISI - 1) haftasonu çalışılabilir.
@@ -130,7 +130,6 @@ for c in TUM_CALISANLAR:
         model += haftalik_vardiya_sayisi <= 6, f"Kisit_Maks_6_Gun_{c}_{h}"
         
         # Minimum 5 gün (Standart çalışma)
-        # NOT: Eğer talep kısıtları 5 günden fazla atama gerektirirse, bu kısıt esnek 6. günü kullanmaya zorlar.
         model += haftalik_vardiya_sayisi >= 5, f"Kisit_Min_5_Gun_{c}_{h}"
 
 
@@ -144,7 +143,7 @@ model.solve()
 # Çözüm durumunu kontrol et
 print(f"\nÇözüm Durumu: {LpStatus[model.status]}")
 
-# Sonuçları DataFrame'e toplama ve görüntüleme
+# Sonuçları görüntüleme
 if model.status == LpStatus.Optimal:
     print(f"Minimum Toplam Atanan Vardiya Sayısı (4 Haftalık): {value(model.objective):.0f}")
     
