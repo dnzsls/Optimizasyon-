@@ -49,7 +49,7 @@ model = LpProblem("Bireysel_Calisan_Rostering", LpMinimize)
 # X[calisan][vardiya][hafta][gün]: Binary atama değişkeni
 X = LpVariable.dicts("Atama", (TUM_CALISANLAR, VARDİYALAR, range(1, HAFTA_SAYISI + 1), GUNLER_HAFTA), cat=LpBinary)
 
-# Y[calisan][hafta]: Çalışanın o haftasonu çalışıp çalışmadığını gösteren yardımcı değişken (Düzeltildi)
+# Y[calisan][hafta]: Çalışanın o haftasonu çalışıp çalışmadığını gösteren yardımcı değişken (Düzeltilmiş Tanım)
 Y = LpVariable.dicts("HS_Calisma", (TUM_CALISANLAR, range(1, HAFTA_SAYISI + 1)), cat=LpBinary)
 
 
@@ -114,7 +114,6 @@ for c in TUM_CALISANLAR:
         haftasonu_vardiya_sayisi = lpSum([X[c][v][h][g] for v in VARDİYALAR for g in HAFTA_SONU])
 
         # Eğer haftasonu vardiya sayısı >= 1 ise (çalışma varsa), Y[c,h]=1 olmalıdır.
-        # Bu kısıt, Y'nin tanımını kurar: Eğer toplam vardiya > 0 ise, Y=1'dir.
         model += haftasonu_vardiya_sayisi <= len(HAFTA_SONU) * Y[c, h], f"Kisit_HS_Calisma_Yukari_{c}_{h}"
         
     # Asıl Kısıt: Ayda en fazla (HAFTA_SAYISI - 1) haftasonu çalışılabilir.
@@ -138,6 +137,7 @@ for c in TUM_CALISANLAR:
 # ----------------------------------------------------
 
 print("Model Çözülüyor...")
+# Modelin büyüklüğü nedeniyle, küçük bir örnekte bile çözüm zaman alabilir.
 model.solve()
 
 # Çözüm durumunu kontrol et
@@ -157,19 +157,27 @@ if model.status == LpStatus.Optimal:
             
             for g in GUNLER_HAFTA:
                 for v in VARDİYALAR:
-                    if value(X[c][v][h][g]) == 1:
-                        sonuclar.append({
-                            'Çalışan': c,
-                            'Hafta': h,
-                            'Gün': g,
-                            'Vardiya': v,
-                            'Becerisi': BECERILER[c]
-                        })
-                        haftalik_calisma[h] += 1
+                    # value() çağrısını try-except ile sarmalayarak olası hataları engelleme
+                    try:
+                        if value(X[c][v][h][g]) == 1:
+                            sonuclar.append({
+                                'Çalışan': c,
+                                'Hafta': h,
+                                'Gün': g,
+                                'Vardiya': v,
+                                'Becerisi': BECERILER[c]
+                            })
+                            haftalik_calisma[h] += 1
+                    except Exception:
+                        # Eğer çözümde bazı değişkenlere değer atanmadıysa, bu kısmı atla.
+                        pass
             
             # Haftasonu izin kontrolü (Kısıt 4 kontrolü)
-            if value(Y[c, h]) == 0:
-                haftasonu_izin_sayisi += 1
+            try:
+                if value(Y[c, h]) == 0:
+                    haftasonu_izin_sayisi += 1
+            except Exception:
+                pass
 
         print(f"\nÇalışan {c} Özeti:")
         print(f"  Haftalık Çalışma Günleri: {haftalik_calisma}")
@@ -178,7 +186,7 @@ if model.status == LpStatus.Optimal:
 
     df_atama = pd.DataFrame(sonuclar)
     
-    print("\n--- Bireysel Atama Sonuçları (İlk 20 Kayıt) ---")
+    print("\n--- Bireysel Atama Sonuçları (Tüm Atananlar) ---")
     df_pivot = df_atama.pivot_table(
         index=['Çalışan', 'Hafta'],
         columns='Gün',
@@ -188,7 +196,7 @@ if model.status == LpStatus.Optimal:
     )
     # Pivot tabloyu haftanın gün sırasına göre sırala
     df_pivot = df_pivot[GUNLER_HAFTA]
-    print(df_pivot.head(20).to_markdown())
+    print(df_pivot.to_markdown())
 
 else:
     print("Optimal bir çözüm bulunamadı.")
