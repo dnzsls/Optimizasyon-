@@ -1,151 +1,195 @@
 from pulp import *
 import pandas as pd
+import numpy as np
 
 # ----------------------------------------------------
-# 1. VERİ TANIMLAMA (Erlang C Çıktıları Temel Alınmıştır)
+# 1. VERİ TANIMLAMA
 # ----------------------------------------------------
 
-# Vardiya Tanımları
+# Çalışan Tanımları (Örnek çalışan listesi ve becerileri)
+A_CALISANLARI = [f'A{i}' for i in range(1, 4)]  # 3 A-Uzmanı
+B_CALISANLARI = [f'B{i}' for i in range(1, 3)]  # 2 B-Uzmanı (A'ya yardım edebilir)
+TUM_CALISANLAR = A_CALISANLARI + B_CALISANLARI
+BECERILER = {c: ('A',) for c in A_CALISANLARI}
+BECERILER.update({c: ('A', 'B') for c in B_CALISANLARI}) # B uzmanları hem A hem B yapabilir
+
+# Zaman ve Vardiya Tanımları
 VARDİYALAR = ['Sabah', 'Öğle', 'Gece']
-GUNLER = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz']
+GUNLER_HAFTA = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz']
+HAFTA_SAYISI = 4
+PLANLAMA_PERIYODU = [(h, g) for h in range(1, HAFTA_SAYISI + 1) for g in GUNLER_HAFTA]
 
-# Çalışan Tipleri ve Kapasiteleri (Yeni Kısıt Verisi)
-CALISAN_GRUPLARI = ['A_Uzman', 'B_Uzman']
-KAPASITE_A = 35  # Toplam A-Uzman sayısı
-KAPASITE_B = 25  # Toplam B-Uzman sayısı
-CALISMA_GUNU_STANDARDI = 5 # Haftalık ortalama çalışma günü
+# Hafta Sonu İndeksleri (Kısıt 4 ve Kısıt 5 için kullanılıyor)
+HAFTA_SONU = ['Cmt', 'Paz']
 
-MAX_A_SHIFTS_PER_WEEK = KAPASITE_A * CALISMA_GUNU_STANDARDI # 35 * 5 = 175
-MAX_B_SHIFTS_PER_WEEK = KAPASITE_B * CALISMA_GUNU_STANDARDI # 25 * 5 = 125
-
-
-# Erlang C'den gelen Personel İhtiyacı (Talep Matrisi)
-DEMAND = {
-    'A': { # Kuyruk A Talebi
-        'Sabah': {'Pzt': 5, 'Sal': 5, 'Çar': 5, 'Per': 5, 'Cum': 6, 'Cmt': 7, 'Paz': 6},
-        'Öğle':  {'Pzt': 7, 'Sal': 7, 'Çar': 7, 'Per': 7, 'Cum': 8, 'Cmt': 9, 'Paz': 8},
-        'Gece':  {'Pzt': 3, 'Sal': 3, 'Çar': 3, 'Per': 3, 'Cum': 4, 'Cmt': 4, 'Paz': 3}
+# DEMAND_STAFF (Vardiya/gün başına gerekli minimum personel sayısı)
+DEMAND_STAFF = {
+    'A': { # Kuyruk A Personel Talebi (Örnek Data)
+        'Sabah': {'Pzt': 1, 'Sal': 1, 'Çar': 1, 'Per': 1, 'Cum': 2, 'Cmt': 2, 'Paz': 2},
+        'Öğle':  {'Pzt': 2, 'Sal': 2, 'Çar': 2, 'Per': 2, 'Cum': 3, 'Cmt': 3, 'Paz': 3},
+        'Gece':  {'Pzt': 1, 'Sal': 1, 'Çar': 1, 'Per': 1, 'Cum': 1, 'Cmt': 1, 'Paz': 1}
     },
-    'B': { # Kuyruk B Talebi
-        'Sabah': {'Pzt': 4, 'Sal': 4, 'Çar': 4, 'Per': 4, 'Cum': 4, 'Cmt': 3, 'Paz': 3},
-        'Öğle':  {'Pzt': 5, 'Sal': 5, 'Çar': 5, 'Per': 5, 'Cum': 5, 'Cmt': 3, 'Paz': 3},
-        'Gece':  {'Pzt': 2, 'Sal': 2, 'Çar': 2, 'Per': 2, 'Cum': 2, 'Cmt': 1, 'Paz': 1}
+    'B': { # Kuyruk B Personel Talebi (Örnek Data)
+        'Sabah': {'Pzt': 1, 'Sal': 1, 'Çar': 1, 'Per': 1, 'Cum': 1, 'Cmt': 0, 'Paz': 0},
+        'Öğle':  {'Pzt': 1, 'Sal': 1, 'Çar': 1, 'Per': 1, 'Cum': 1, 'Cmt': 1, 'Paz': 1},
+        'Gece':  {'Pzt': 0, 'Sal': 0, 'Çar': 0, 'Per': 0, 'Cum': 0, 'Cmt': 0, 'Paz': 0}
     }
 }
-
-HAFTA_ICI = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum']
-HAFTA_SONU = ['Cmt', 'Paz']
 
 # ----------------------------------------------------
 # 2. OPTİMİZASYON MODELİNİ OLUŞTURMA
 # ----------------------------------------------------
 
-model = LpProblem("3_Vardiya_Coklu_Beceri_Kapasiteli_Planlama", LpMinimize)
+model = LpProblem("Bireysel_Calisan_Rostering", LpMinimize)
 
 # ----------------------------------------------------
 # 3. KARAR DEĞİŞKENLERİ
 # ----------------------------------------------------
 
-# X_A[vardiya][gün]: O gün, o vardiyaya atanan A_Uzmanı sayısı (Tamsayı)
-X_A = LpVariable.dicts("Atama_A", (VARDİYALAR, GUNLER), lowBound=0, cat=LpInteger)
-
-# X_B[vardiya][gün]: O gün, o vardiyaya atanan B_Uzmanı sayısı (Tamsayı)
-X_B = LpVariable.dicts("Atama_B", (VARDİYALAR, GUNLER), lowBound=0, cat=LpInteger)
+# X[calisan][vardiya][hafta][gün]: i çalışanı, v vardiyasında, h haftasında, g gününde çalışırsa 1, yoksa 0 (BINARY)
+X = LpVariable.dicts("Atama", (TUM_CALISANLAR, VARDİYALAR, range(1, HAFTA_SAYISI + 1), GUNLER_HAFTA), cat=LpBinary)
 
 # ----------------------------------------------------
 # 4. AMAÇ FONKSİYONU
 # ----------------------------------------------------
 
-# Amaç: Atanan toplam çalışan sayısını (maliyeti) minimuma indirmek.
-model += lpSum([X_A[v][g] + X_B[v][g] for v in VARDİYALAR for g in GUNLER]), "Toplam_Calisan_Maliyeti"
+# Amaç: Atanan toplam vardiya sayısını minimuma indirmek (Maliyeti düşürmek)
+model += lpSum([X[c][v][h][g] for c in TUM_CALISANLAR for v in VARDİYALAR for h in range(1, HAFTA_SAYISI + 1) for g in GUNLER_HAFTA]), "Toplam_Vardiya_Sayisi"
 
 # ----------------------------------------------------
-# 5. KISITLAR (CONSTRAINTS)
+# 5. TEMEL KISITLAR (Talep ve Kapasite)
 # ----------------------------------------------------
 
-# Kısıt 1: B Kuyruğu Talep Kısıtı (Sadece B-Uzmanları karşılayabilir)
-for v in VARDİYALAR:
-    for g in GUNLER:
-        model += X_B[v][g] >= DEMAND['B'][v][g], f"Kisit_B_Talep_{v}_{g}"
+# Kısıt 1: Bireysel Kapasite (Bir çalışan bir gün sadece 1 vardiya çalışır)
+for c in TUM_CALISANLAR:
+    for h in range(1, HAFTA_SAYISI + 1):
+        for g in GUNLER_HAFTA:
+            model += lpSum([X[c][v][h][g] for v in VARDİYALAR]) <= 1, f"Kisit_Tek_Vardiya_{c}_{h}_{g}"
 
-# Kısıt 2: A Kuyruğu Talep Kısıtı (Esneklik Kuralı)
+# Kısıt 2: Talep Kısıtı (Tüm Talep Karşılanmalı)
 for v in VARDİYALAR:
-    for g in GUNLER:
-        if g in HAFTA_SONU:
-            # Hafta Sonu Kuralı: B'den A'ya YARDIM YOK (Sabit Kural)
-            model += X_A[v][g] >= DEMAND['A'][v][g], f"Kisit_A_Talep_HS_{v}_{g}"
+    for h in range(1, HAFTA_SAYISI + 1):
+        for g in GUNLER_HAFTA:
+            
+            A_talep = DEMAND_STAFF['A'][v][g]
+            B_talep = DEMAND_STAFF['B'][v][g]
+            
+            # B Kuyruğu Kısıtı (Sadece B-Uzmanları tarafından karşılanır)
+            model += lpSum([X[c][v][h][g] for c in B_CALISANLARI]) >= B_talep, f"Kisit_Talep_B_{v}_{h}_{g}"
+            
+            # A Kuyruğu Kısıtı (A-Uzmanları + B-Uzmanları (Hafta içi esnek))
+            if g in HAFTA_SONU:
+                # Hafta Sonu: B'den A'ya yardım yok (Sadece A-Uzmanları)
+                model += lpSum([X[c][v][h][g] for c in A_CALISANLARI]) >= A_talep, f"Kisit_Talep_A_HS_{v}_{h}_{g}"
+            else:
+                # Hafta İçi: B'den A'ya yardım var (A-Uzmanları + B-Uzmanları)
+                model += lpSum([X[c][v][h][g] for c in TUM_CALISANLAR]) >= A_talep, f"Kisit_Talep_A_HI_{v}_{h}_{g}"
+
+
+# ----------------------------------------------------
+# 6. MESAI VE DİNLENME KISITLARI
+# ----------------------------------------------------
+
+# Kısıt 3: Maksimum Ardışık Vardiya Kısıtı (Maks. 2 Gün Üst Üste Çalışma)
+for c in TUM_CALISANLAR:
+    for h in range(1, HAFTA_SAYISI + 1):
+        # 3'erli gün gruplarını kontrol et (g, g+1, g+2)
+        for i in range(len(GUNLER_HAFTA) - 2): 
+            g1, g2, g3 = GUNLER_HAFTA[i], GUNLER_HAFTA[i+1], GUNLER_HAFTA[i+2]
+            
+            # Üç ardışık günde çalışan toplam vardiya sayısı <= 2 olmalıdır.
+            model += lpSum([X[c][v][h][g1] for v in VARDİYALAR]) + \
+                     lpSum([X[c][v][h][g2] for v in VARDİYALAR]) + \
+                     lpSum([X[c][v][h][g3] for v in VARDİYALAR]) <= 2, \
+                     f"Kisit_Max_2_Gun_Calisma_{c}_{h}_{g1}"
+
+# Kısıt 4: Aylık Haftasonu Kısıtı (Bir çalışan ayda en az bir Haftasonu tamamen izinli olmalı)
+for c in TUM_CALISANLAR:
+    # Her hafta sonu çalışıp çalışmadığını gösteren yardımcı binary değişkenler (Y)
+    Y = LpVariable.dicts("HS_Calisma", (c, range(1, HAFTA_SAYISI + 1)), cat=LpBinary)
+
+    for h in range(1, HAFTA_SAYISI + 1):
+        # O haftasonu atanan toplam vardiya sayısı (Cmt ve Paz toplamı)
+        haftasonu_vardiya_sayisi = lpSum([X[c][v][h][g] for v in VARDİYALAR for g in HAFTA_SONU])
+
+        # Eğer haftasonu vardiya sayısı >= 1 ise (çalışma varsa), Y[c,h]=1 olmalıdır.
+        # Bu kısıt, Y'nin tanımını kurar: Eğer toplam vardiya > 0 ise, Y=1'dir.
+        # Yüksek katsayı (2, Haftasonu gün sayısı) kullanarak kısıt oluşturulur.
+        model += haftasonu_vardiya_sayisi <= len(HAFTA_SONU) * Y[c, h], f"Kisit_HS_Calisma_Yukari_{c}_{h}"
         
-        else:
-            # Hafta İçi Kuralı: B-Uzmanları A'ya yardım edebilir (Esnek Kural)
-            model += X_A[v][g] + X_B[v][g] >= DEMAND['A'][v][g], f"Kisit_A_Talep_HI_{v}_{g}"
+    # Asıl Kısıt: Ayda en fazla (HAFTA_SAYISI - 1) haftasonu çalışılabilir.
+    model += lpSum([Y[c, h] for h in range(1, HAFTA_SAYISI + 1)]) <= HAFTA_SAYISI - 1, f"Kisit_Min_1_HS_Izin_{c}"
 
-# Kısıt 3: Negatif Olmama Kısıtı (Karar değişkenlerinin >= 0 olması)
-# (Bu, LpVariable tanımında 'lowBound=0' ile zaten sağlanmıştır.)
 
-# Kısıt 4 (YENİ): A-Uzmanları Haftalık Kapasite Kısıtı
-# A-Uzmanlarına atanan toplam vardiya sayısı, maksimum kapasitelerinin (175 shift) üzerine çıkamaz.
-model += lpSum([X_A[v][g] for v in VARDİYALAR for g in GUNLER]) <= MAX_A_SHIFTS_PER_WEEK, "Kisit_A_Kapasite"
+# Kısıt 5: Esnek 6. Gün Kısıtı (Haftada min 5, maks 6 gün çalışma)
+for c in TUM_CALISANLAR:
+    for h in range(1, HAFTA_SAYISI + 1):
+        haftalik_vardiya_sayisi = lpSum([X[c][v][h][g] for v in VARDİYALAR for g in GUNLER_HAFTA])
+        
+        # Maksimum 6 gün (İhtiyaç olursa 6. gün çalışılabilir)
+        model += haftalik_vardiya_sayisi <= 6, f"Kisit_Maks_6_Gun_{c}_{h}"
+        
+        # Minimum 5 gün (Standart çalışma)
+        # NOT: Eğer talep kısıtları 5 günden fazla atama gerektirirse, bu kısıt esnek 6. günü kullanmaya zorlar.
+        model += haftalik_vardiya_sayisi >= 5, f"Kisit_Min_5_Gun_{c}_{h}"
 
-# Kısıt 5 (YENİ): B-Uzmanları Haftalık Kapasite Kısıtı
-# B-Uzmanlarına atanan toplam vardiya sayısı, maksimum kapasitelerinin (125 shift) üzerine çıkamaz.
-model += lpSum([X_B[v][g] for v in VARDİYALAR for g in GUNLER]) <= MAX_B_SHIFTS_PER_WEEK, "Kisit_B_Kapasite"
 
 # ----------------------------------------------------
-# 6. MODELİ ÇÖZME VE SONUÇLARI GÖRÜNTÜLEME
+# 7. MODELİ ÇÖZME VE SONUÇLARI GÖRÜNTÜLEME
 # ----------------------------------------------------
 
+print("Model Çözülüyor...")
 model.solve()
 
 # Çözüm durumunu kontrol et
-print(f"Durum: {LpStatus[model.status]}\n")
+print(f"\nÇözüm Durumu: {LpStatus[model.status]}")
 
-# Sonuçları toplama
-sonuclar = []
-toplam_a_atanan = 0
-toplam_b_atanan = 0
+# Sonuçları DataFrame'e toplama ve görüntüleme
+if model.status == LpStatus.Optimal:
+    print(f"Minimum Toplam Atanan Vardiya Sayısı (4 Haftalık): {value(model.objective):.0f}")
+    
+    sonuclar = []
+    for c in TUM_CALISANLAR:
+        haftalik_calisma = {}
+        haftasonu_izin_sayisi = 0
+        
+        for h in range(1, HAFTA_SAYISI + 1):
+            haftalik_calisma[h] = 0
+            
+            for g in GUNLER_HAFTA:
+                for v in VARDİYALAR:
+                    if value(X[c][v][h][g]) == 1:
+                        sonuclar.append({
+                            'Çalışan': c,
+                            'Hafta': h,
+                            'Gün': g,
+                            'Vardiya': v,
+                            'Becerisi': BECERILER[c]
+                        })
+                        haftalik_calisma[h] += 1
+            
+            # Haftasonu izin kontrolü (Kısıt 4 kontrolü)
+            if value(Y[c, h]) == 0:
+                haftasonu_izin_sayisi += 1
 
-for v in VARDİYALAR:
-    for g in GUNLER:
-        A_atanan = value(X_A[v][g])
-        B_atanan = value(X_B[v][g])
-        
-        toplam_a_atanan += A_atanan
-        toplam_b_atanan += B_atanan
-        
-        A_talep = DEMAND['A'][v][g]
-        B_talep = DEMAND['B'][v][g]
-        
-        B_A_destek = 0
-        A_karsilayan_toplam = A_atanan
-        
-        if g in HAFTA_ICI:
-            # B'ye atanan personelin B talebini karşıladıktan sonraki fazlalığı destek olarak sayılır.
-            B_A_destek = max(0, B_atanan - B_talep)
-            A_karsilayan_toplam = A_atanan + B_A_destek
-        
-        sonuclar.append({
-            'Vardiya': v,
-            'Gün': g,
-            'A Talep': A_talep,
-            'B Talep': B_talep,
-            'Atanan A-Uzmanları': A_atanan,
-            'Atanan B-Uzmanları': B_atanan,
-            'A Karsilayan Toplam': A_karsilayan_toplam,
-            'B\'den A\'ya Destek (HI)': B_A_destek if g in HAFTA_ICI else 0,
-        })
+        print(f"\nÇalışan {c} Özeti:")
+        print(f"  Haftalık Çalışma Günleri: {haftalik_calisma}")
+        print(f"  Ayda Alınan Haftasonu İzni Sayısı: {haftasonu_izin_sayisi} (Min 1 Olmalı)")
 
-df_sonuc = pd.DataFrame(sonuclar)
 
-print("--- Vardiya Bazında Personel Dağılımı Sonuçları ---")
-# Pivot tablo ile daha okunabilir hale getiriyoruz
-df_pivot = df_sonuc.pivot_table(
-    index=['Vardiya', 'Gün'], 
-    values=['Atanan A-Uzmanları', 'Atanan B-Uzmanları', 'A Talep', 'B Talep', 'A Karsilayan Toplam'], 
-    aggfunc='first'
-)
-print(df_pivot.to_markdown(floatfmt=".0f"))
+    df_atama = pd.DataFrame(sonuclar)
+    
+    print("\n--- Bireysel Atama Sonuçları (İlk 20 Kayıt) ---")
+    df_pivot = df_atama.pivot_table(
+        index=['Çalışan', 'Hafta'],
+        columns='Gün',
+        values='Vardiya',
+        aggfunc=lambda x: ','.join(x.astype(str)) if len(x) > 0 else '',
+        fill_value=''
+    )
+    # Pivot tabloyu haftanın gün sırasına göre sırala
+    df_pivot = df_pivot[GUNLER_HAFTA]
+    print(df_pivot.head(20).to_markdown())
 
-print("\n--- Haftalık Kapasite Özeti ---")
-print(f"Minimum Toplam Atanan Çalışan Gün Sayısı (Haftalık): {value(model.objective):.0f}")
-print(f"Toplam Atanan A-Uzman Vardiyası: {toplam_a_atanan:.0f} (Maks. Kapasite: {MAX_A_SHIFTS_PER_WEEK})")
-print(f"Toplam Atanan B-Uzman Vardiyası: {toplam_b_atanan:.0f} (Maks. Kapasite: {MAX_B_SHIFTS_PER_WEEK})")
+else:
+    print("Optimal bir çözüm bulunamadı.")
