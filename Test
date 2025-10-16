@@ -1,304 +1,161 @@
-# ===========================
-# WEEK PLAN FROM DF (pyworkforce + PuLP) — SAYI MODU
-# ===========================
+from pulp import *
 import pandas as pd
-from math import ceil
-from pulp import LpProblem, LpMinimize, LpVariable, LpInteger, lpSum, PULP_CBC_CMD, LpStatus
-from pyworkforce.queuing import ErlangC
 
-# -------- 0) Sabitler --------
-SL_TGT       = {"A": 0.80, "B": 0.80}
-ASA_MIN      = {"A": 0.5,  "B": 0.5}   # 30 sn
-AHT_MIN      = {"A": 3.0,  "B": 3.0}   # 180 sn
-INTERVAL_MIN = 15                      # DF'nin çözünürlüğü 15 dk
-MAX_OCC      = 0.90
-W_UNDER, W_OVER = 3.0, 1.0
+# ----------------------------------------------------
+# 1. VERİ TANIMLAMA
+# ----------------------------------------------------
 
-SHIFT_STARTS_MIN = [8*60, 9*60, 10*60, 15*60, 17*60]
-SHIFT_LEN_MIN    = 9*60
+# Örnek Talep Verisi (Brüt Personel İhtiyacı - Shrinkage dahil)
+# Bu değerler, Erlang C hesabı sonrası çıkan NİHAİ personel ihtiyacıdır.
+# Senaryoyu basitleştirmek için tek bir 8 saatlik vardiya dönemine odaklanalım.
+# İhtiyaç: Pazartesi - Pazar günleri için 8 saatlik vardiyada gerekli kişi sayısı.
 
-# -------- Yardımcılar --------
-def df_to_forecast(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Girdi DF kolonları: model_data_date, a_call_count, b_call_count
-    Çıktı: df_forecast[date, interval_start_min, queue in {'A','B'}, arrivals]
-    """
-    need = {"model_data_date","a_call_count","b_call_count"}
-    if not need.issubset(df_raw.columns):
-        raise ValueError(f"Gerekli kolonlar eksik. Gerekli: {need}")
+# Kuyruk A (Yüksek Öncelikli/Uzmanlık Gerektiren) - Sadece A-Uzmanları ve B-Uzmanları (Yardım amaçlı)
+DEMAND_A = {
+    'Pzt': 10, 'Sal': 10, 'Çar': 10, 'Per': 10, 'Cum': 10,
+    'Cmt': 12, 'Paz': 12
+}
 
-    dt = pd.to_datetime(df_raw["model_data_date"])
-    base = pd.DataFrame({
-        "date": dt.dt.strftime("%Y-%m-%d"),
-        "interval_start_min": dt.dt.hour*60 + dt.dt.minute
+# Kuyruk B (Normal İş Yükü) - Sadece B-Uzmanları karşılayabilir.
+DEMAND_B = {
+    'Pzt': 8, 'Sal': 8, 'Çar': 8, 'Per': 8, 'Cum': 8,
+    'Cmt': 5, 'Paz': 5
+}
+
+# Çalışan Tipleri ve Maliyet
+CALISAN_GRUPLARI = ['A_Uzman', 'B_Uzman']
+GUNLER = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz']
+
+# Planlama kısıtları
+MAX_CALISAN_SAYISI = 40 # Toplam mevcut çalışan sayısı
+HAFTA_ICI = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum']
+HAFTA_SONU = ['Cmt', 'Paz']
+
+# ----------------------------------------------------
+# 2. OPTİMİZASYON MODELİNİ OLUŞTURMA
+# ----------------------------------------------------
+
+model = LpProblem("Coklu_Beceri_Vardiya_Planlama", LpMinimize)
+
+# ----------------------------------------------------
+# 3. KARAR DEĞİŞKENLERİ
+# ----------------------------------------------------
+
+# i çalışanın, g gününde vardiyada olup olmadığını gösterir (Binary değişken: 0 veya 1)
+# Burada, çalışan tipi bazında kaç kişinin o gün vardiyaya atanacağını belirliyoruz.
+
+# A-Uzmanı atamaları
+X_A = LpVariable.dicts("Atama_A", (GUNLER), 0, MAX_CALISAN_SAYISI, LpInteger)
+
+# B-Uzmanı atamaları
+X_B = LpVariable.dicts("Atama_B", (GUNLER), 0, MAX_CALISAN_SAYISI, LpInteger)
+
+# ----------------------------------------------------
+# 4. AMAÇ FONKSİYONU
+# ----------------------------------------------------
+
+# Amaç: Atanan toplam çalışan sayısını (maliyeti) minimuma indirmek.
+# Herkesin maliyetinin eşit olduğunu varsayalım (örneğin 1 birim).
+
+model += lpSum([X_A[g] + X_B[g] for g in GUNLER]), "Toplam_Calisan_Maliyeti"
+
+# ----------------------------------------------------
+# 5. KISITLAR (CONSTRAINTS)
+# ----------------------------------------------------
+
+# Kısıt 1: B Kuyruğu Talep Kısıtı (Sadece B-Uzmanları karşılayabilir)
+# B-Uzmanları, B kuyruğu talebini karşılamak zorundadır.
+for g in GUNLER:
+    model += X_B[g] >= DEMAND_B[g], f"Kisit_B_Talep_{g}"
+
+# Kısıt 2: Kuyruk A Talep Kısıtı (Esneklik burada devreye girer)
+# A kuyruğu talebi = A-Uzmanları + B-Uzmanlarından gelen destek
+
+for g in GUNLER:
+    if g in HAFTA_SONU:
+        # Hafta Sonu: B-Uzmanları KENDİ kuyruğunda. A'ya YARDIM YOK.
+        # Sadece A-Uzmanları A talebini karşılamak zorunda.
+        model += X_A[g] >= DEMAND_A[g], f"Kisit_A_Talep_HS_{g}"
+    
+    else:
+        # Hafta İçi: B-Uzmanları A'ya yardım edebilir.
+        # A'ya atanan A-Uzmanları + (B'nin ihtiyacını karşıladıktan sonra kalan B-Uzmanları) >= A talebi
+        
+        # Bu kısıtı modellemek için:
+        # A'nın kalan ihtiyacı, B'nin fazlası tarafından karşılanacak.
+        
+        # Basit Modelleme: B-Uzmanlarının tamamının A'ya destek verebileceğini kabul ederek
+        model += X_A[g] + X_B[g] >= DEMAND_A[g], f"Kisit_A_Talep_HI_{g}"
+        
+        # NOT: Bu basit model, B'nin ihtiyacı karşılandıktan sonra A'ya destek gittiğini varsayar. 
+        # Gerçek optimizasyon yazılımları, bu esnekliği B-Uzmanlarının B ve A arasındaki 
+        # *zaman dilimi dağılımı* üzerinden daha karmaşık (ve doğru) şekilde çözer.
+        
+# Kısıt 3: Toplam Atanan B-Uzmanlarının Sayısı
+# B-Uzmanları, hem B'yi karşılamak hem de A'ya yardım etmek zorundadır.
+# Bu kısıt, B'nin minimum talebini garanti altına alırken, A'ya da destek sağlayacak şekilde 
+# B-Uzmanlarının atanmasını sağlar (Kısıt 1 ve Kısıt 2 birlikte çalışır).
+
+# Kısıt 4: Çalışan Kısıtı (Tüm Çalışan Sayısı)
+# Atanan A ve B uzmanlarının haftalık toplamının, toplam çalışan sayısını aşmaması gerekir.
+# (Bu model, her çalışanın sadece 1 vardiya çalıştığını varsayar, bu nedenle günlük atama = günlük farklı çalışan sayısıdır).
+
+# En azından B grubuna atanması gereken toplam (haftalık) minimum çalışan sayısı:
+# B-Grubu'nun günlük minimum talepleri ve 5 gün çalışma kısıtı (örnek bir ek kısıt)
+
+# model += lpSum([X_A[g] for g in GUNLER]) + lpSum([X_B[g] for g in GUNLER]) <= MAX_CALISAN_SAYISI * 7 # Basit örnek
+# Daha gerçekçi bir kısıt:
+# Toplam (A+B) uzmanlarının haftalık toplamı, toplam kapasitemizi aşmamalı.
+# (Gerçek hayatta bu, *toplam çalışan sayısı* ve *çalışma günü sayısı* üzerinden hesaplanır.)
+model += lpSum([X_A[g] for g in GUNLER]) + lpSum([X_B[g] for g in GUNLER]) <= MAX_CALISAN_SAYISI * 7, "Maks_Haftalik_Atama"
+# Bu, her bir çalışanın sadece bir gün çalıştığı varsayımıyla çalışır. Gerçekte, bir çalışan 5 gün çalışır.
+
+# ----------------------------------------------------
+# 6. MODELİ ÇÖZME VE SONUÇLARI GÖRÜNTÜLEME
+# ----------------------------------------------------
+
+# Modeli çöz
+model.solve()
+
+# Çözüm durumunu kontrol et
+print(f"Durum: {LpStatus[model.status]}\n")
+
+# Sonuçları DataFrame'e aktar
+sonuclar = []
+for g in GUNLER:
+    A_atanan = value(X_A[g])
+    B_atanan = value(X_B[g])
+    
+    # A kuyruğu için toplam personel (A+B yardımı)
+    if g in HAFTA_SONU:
+        # Hafta Sonu: Sadece A-Uzmanları
+        A_toplam_karsilayan = A_atanan
+        B_A_destek = 0
+    else:
+        # Hafta İçi: B'den A'ya destek var
+        # B'nin ihtiyacını karşılamak için B_atanan'ın bir kısmı B'de kalır (DEMAND_B[g])
+        # Geri kalanı A'ya destek olur.
+        B_A_destek = max(0, B_atanan - DEMAND_B[g])
+        A_toplam_karsilayan = A_atanan + B_A_destek
+
+    sonuclar.append({
+        'Gün': g,
+        'A Talep': DEMAND_A[g],
+        'B Talep': DEMAND_B[g],
+        'Atanan A-Uzmanları': A_atanan,
+        'Atanan B-Uzmanları': B_atanan,
+        'A Kuyruğunu Karşılayan TOPLAM': A_toplam_karsilayan,
+        'B'den A\'ya Destek (H.Içi)': B_A_destek if g in HAFTA_ICI else 'N/A',
+        'A Karsilandi mi?': 'EVET' if A_toplam_karsilayan >= DEMAND_A[g] else 'HAYIR',
+        'B Karsilandi mi?': 'EVET' if B_atanan >= DEMAND_B[g] else 'HAYIR'
     })
-    A = base.copy(); A["queue"] = "A"; A["arrivals"] = df_raw["a_call_count"].astype(float)
-    B = base.copy(); B["queue"] = "B"; B["arrivals"] = df_raw["b_call_count"].astype(float)
-    return pd.concat([A,B], ignore_index=True).sort_values(["date","interval_start_min","queue"])
 
-def to_30min(df_15: pd.DataFrame) -> pd.DataFrame:
-    g = df_15.copy()
-    g["interval_30"] = (g["interval_start_min"] // 30) * 30
-    out = (g.groupby(["date","queue","interval_30"], as_index=False)["arrivals"]
-             .sum()
-             .rename(columns={"interval_30":"interval_start_min"}))
-    return out
+df_sonuc = pd.DataFrame(sonuclar)
 
-def required_positions_pywf(transactions:int, aht_min:float, asa_min:float,
-                            interval_min:int=15, sl_target:float=0.80,
-                            max_occupancy:float=0.90, shrinkage:float=0.0) -> int:
-    er = ErlangC(
-        transactions=int(transactions),
-        asa=asa_min,
-        aht=aht_min,
-        interval=interval_min,
-        shrinkage=shrinkage
-    )
-    return er.required_positions(service_level=sl_target, max_occupancy=max_occupancy)
+print("--- Planlama Sonuçları (Personel Sayısı) ---")
+print(df_sonuc.to_markdown(index=False, floatfmt=".0f"))
+print(f"\nMinimum Toplam Çalışan Gün Sayısı: {value(model.objective):.0f}")
 
-def compute_required_df(df_forecast: pd.DataFrame, shrinkage: float = 0.0) -> dict:
-    req = {}
-    for _, r in df_forecast.iterrows():
-        d, t, q, calls = r["date"], int(r["interval_start_min"]), r["queue"], float(r["arrivals"])
-        n = required_positions_pywf(
-            transactions=calls, aht_min=AHT_MIN[q], asa_min=ASA_MIN[q],
-            interval_min=INTERVAL_MIN, sl_target=SL_TGT[q], max_occupancy=MAX_OCC, shrinkage=0.0
-        )
-        if shrinkage > 0:
-            n = ceil(n / (1 - shrinkage))
-        req[(d, t, q)] = n
-    return req
-
-# -------- ILP — Sadece sayı modu (tek gün) --------
-def assign_with_counts_one_day(df_day: pd.DataFrame, A_max:int, B_max:int, is_weekend:bool):
-    intervals = sorted(df_day["interval_start_min"].unique())
-    queues = ["A","B"]
-    req = compute_required_df(df_day)
-
-    m = LpProblem("Assignment_With_Counts", LpMinimize)
-    n = {(t,q): LpVariable(f"n_{t}_{q}", lowBound=0, cat=LpInteger) for t in intervals for q in queues}
-    under = {(t,q): LpVariable(f"u_{t}_{q}", lowBound=0) for t in intervals for q in queues}
-    over  = {(t,q): LpVariable(f"o_{t}_{q}", lowBound=0) for t in intervals for q in queues}
-
-    for t in intervals:
-        if is_weekend:
-            m += n[(t,"A")] <= A_max
-            m += n[(t,"B")] <= B_max
-        else:
-            m += n[(t,"B")] <= B_max
-            m += n[(t,"A")] <= A_max + B_max   # B→A destek açık
-
-    d = df_day["date"].iloc[0]
-    for t in intervals:
-        for q in queues:
-            m += n[(t,q)] - req.get((d,t,q),0) == over[(t,q)] - under[(t,q)]
-
-    m += lpSum(W_UNDER*under[(t,q)] + W_OVER*over[(t,q)] for t in intervals for q in queues)
-    m.solve(PULP_CBC_CMD(msg=False))
-
-    rows = []
-    for t in intervals:
-        for q in queues:
-            rows.append({
-                "date": d, "t": t, "queue": q,
-                "required": req.get((d,t,q),0),
-                "planned": int(round(n[(t,q)].value() or 0)),
-                "under": under[(t,q)].value(),
-                "over":  over[(t,q)].value()
-            })
-    return pd.DataFrame(rows)
-
-# -------- Haftalık plan (DF -> tüm günler) --------
-def plan_week_from_df(df_raw: pd.DataFrame, a_cap:int=85, b_cap:int=56,
-                      aggregate_to_30min: bool=True) -> pd.DataFrame:
-    """
-    1) DF -> forecast (A/B satır)
-    2) (ops.) 30 dk topla
-    3) Gün gün çöz (hafta içi B→A açık, hafta sonu kapalı)
-    4) Birleştir
-    """
-    df_forecast = df_to_forecast(df_raw)
-    if aggregate_to_30min:
-        df_forecast = to_30min(df_forecast)
-
-    out = []
-    for d, g in df_forecast.groupby("date"):
-        is_weekend = pd.to_datetime(d).dayofweek >= 5  # Mon=0..Sun=6
-        out.append(assign_with_counts_one_day(g, A_max=a_cap, B_max=b_cap, is_weekend=is_weekend))
-    return pd.concat(out, ignore_index=True).sort_values(["date","t","queue"])
-
-# -------- (İsteğe bağlı) — Vardiya sayıları --------
-def plan_shifts_greedy(planned_df: pd.DataFrame,
-                       shift_starts_min=None, shift_len_min:int=SHIFT_LEN_MIN):
-    if shift_starts_min is None:
-        shift_starts_min = SHIFT_STARTS_MIN
-    out = []
-    for date, gday in planned_df.groupby("date"):
-        periods = sorted(gday["t"].unique())
-        def cov(start): return [1 if (start <= t < start+shift_len_min) else 0 for t in periods]
-        for q in ["A","B"]:
-            need = gday[gday["queue"]==q].set_index("t")["planned"].reindex(periods).fillna(0).astype(int).tolist()
-            shifts = []
-            covm = {s: cov(s) for s in shift_starts_min}
-            while True:
-                best, gain = None, 0
-                for s in shift_starts_min:
-                    g = sum(1 for i in range(len(periods)) if covm[s][i]==1 and need[i]>0)
-                    if g > gain: best, gain = s, g
-                if gain <= 0: break
-                shifts.append(best)
-                for i in range(len(periods)):
-                    if covm[best][i]==1 and need[i]>0: need[i]-=1
-            if shifts:
-                from collections import Counter
-                for s,cnt in Counter(shifts).items():
-                    out.append({"date":date,"queue":q,"shift_start_min":int(s),"count":int(cnt)})
-    return pd.DataFrame(out)
-
-# ---------------- Kullanım ----------------
-# df_raw = ...  # SQL'den çektiğin DataFrame (model_data_date, a_call_count, b_call_count)
-# planned_week = plan_week_from_df(df_raw, a_cap=85, b_cap=56, aggregate_to_30min=True)
-# shifts_week  = plan_shifts_greedy(planned_week)
-# planned_week.to_csv("planned_counts_week.csv", index=False)
-# shifts_week.to_csv("shifts_week.csv", index=False)
-
-
-
-
-
-
-def assign_with_counts_one_day(df_day: pd.DataFrame,
-                               A_max: int, B_max: int,
-                               is_weekend: bool,
-                               delta_penalty: float = 0.2):  # NEW
-    intervals = sorted(df_day["interval_start_min"].unique())
-    queues = ["A","B"]
-    req = compute_required_df(df_day)
-
-    m = LpProblem("Assignment_With_Counts", LpMinimize)
-    n = {(t,q): LpVariable(f"n_{t}_{q}", lowBound=0, cat=LpInteger) for t in intervals for q in queues}
-    under = {(t,q): LpVariable(f"u_{t}_{q}", lowBound=0) for t in intervals for q in queues}
-    over  = {(t,q): LpVariable(f"o_{t}_{q}", lowBound=0) for t in intervals for q in queues}
-
-    # Kapasiteler + cross
-    for t in intervals:
-        if is_weekend:
-            m += n[(t,"A")] <= A_max
-            m += n[(t,"B")] <= B_max
-        else:
-            m += n[(t,"B")] <= B_max
-            m += n[(t,"A")] <= A_max + B_max  # B→A destek açık
-
-    # Talep dengesi
-    d = df_day["date"].iloc[0]
-    for t in intervals:
-        for q in queues:
-            m += n[(t,q)] - req.get((d,t,q),0) == over[(t,q)] - under[(t,q)]
-
-    # NEW: zaman-serisi pürüzsüzleştirme |n_t - n_{t-1}| için değişkenler ve kısıtlar
-    deltas = []
-    for q in queues:
-        for i in range(1, len(intervals)):
-            t0, t1 = intervals[i-1], intervals[i]
-            dv = LpVariable(f"delta_{q}_{t1}", lowBound=0)
-            m += n[(t1,q)] - n[(t0,q)] <= dv
-            m += n[(t0,q)] - n[(t1,q)] <= dv
-            deltas.append(dv)
-
-    # Amaç: under ağır + over hafif + pürüzsüzlük cezası
-    m += lpSum(3*under[(t,q)] + 1*over[(t,q)] for t in intervals for q in queues) \
-         + delta_penalty * lpSum(deltas)
-
-    m.solve(PULP_CBC_CMD(msg=False))
-
-    rows = []
-    for t in intervals:
-        for q in queues:
-            rows.append({
-                "date": d, "t": t, "queue": q,
-                "required": req.get((d,t,q),0),
-                "planned": int(round(n[(t,q)].value() or 0)),
-                "under": under[(t,q)].value(),
-                "over":  over[(t,q)].value()
-            })
-    return pd.DataFrame(rows)
-
-
-
-
-
-
-def plan_shifts_ilp(planned_df: pd.DataFrame,
-                    shift_starts_min=None,
-                    shift_len_min:int=9*60,
-                    slot_min:int=30,
-                    break_windows=[(9*60+15,10*60+30,1),(12*60,14*60+30,3),(15*60+45,16*60+30,1)],
-                    w_under:float=3.0, w_over:float=1.0):
-    if shift_starts_min is None:
-        shift_starts_min = [8*60, 9*60, 10*60, 15*60, 17*60]
-
-    out = []
-    for date, gday in planned_df.groupby("date"):
-        periods = sorted(gday["t"].unique())
-        idx = {t:i for i,t in enumerate(periods)}
-        P = len(periods)
-
-        # coverage matrisleri
-        def cov_vec(start):
-            v = [0]*P
-            for i,t in enumerate(periods):
-                if start <= t < start + shift_len_min:
-                    v[i] = 1
-            return v
-
-        for q in ["A","B"]:
-            need = [int(gday[(gday["t"]==t)&(gday["queue"]==q)]["planned"].iloc[0]) for t in periods]
-            m = LpProblem(f"Shifts_{date}_{q}", LpMinimize)
-            y = {s: LpVariable(f"y_{q}_{s}", lowBound=0, cat=LpInteger) for s in shift_starts_min}
-            under = [LpVariable(f"u_{q}_{i}", lowBound=0) for i in range(P)]
-            over  = [LpVariable(f"o_{q}_{i}", lowBound=0) for i in range(P)]
-
-            cov = {s: cov_vec(s) for s in shift_starts_min}
-
-            # Per-period denge
-            for i in range(P):
-                cover = lpSum(y[s]*cov[s][i] for s in shift_starts_min)
-                m += cover - need[i] == over[i] - under[i]
-
-            # MOLALAR (basit pencere toplam sınırı):
-            # pencere içi toplam coverage <= (pencere_slot_sayısı - boş_bırakılması_gereken_slot)
-            for (b_start, b_end, empty_slots) in break_windows:
-                ids = [i for i,t in enumerate(periods) if b_start <= t < b_end]
-                if not ids: 
-                    continue
-                window_len = len(ids)
-                # toplam coverage, bütün shiftlerin kapsadığı slot sayısıdır:
-                m += lpSum(y[s]*sum(cov[s][i] for i in ids) for s in shift_starts_min) \
-                     <= window_len - empty_slots
-
-            # Amaç
-            m += w_under*lpSum(under) + w_over*lpSum(over) + 0.01*lpSum(y.values())
-            m.solve(PULP_CBC_CMD(msg=False))
-
-            for s in shift_starts_min:
-                c = int(round(y[s].value() or 0))
-                if c>0:
-                    out.append({"date":date, "queue":q, "shift_start_min":int(s), "count":c})
-    return pd.DataFrame(out)
-
-
-
-
-
-# df_raw = ...  # SQL'den gelen DF (model_data_date, a_call_count, b_call_count)
-
-planned_week = plan_week_from_df(df_raw, a_cap=85, b_cap=56, aggregate_to_30min=True)
-
-# Zaman serisi dengeleme daha pürüzsüz olsun diye delta_penalty > 0 kullan:
-planned_week = pd.concat([
-    assign_with_counts_one_day(g, 85, 56, is_weekend=(pd.to_datetime(d).dayofweek>=5), delta_penalty=0.2)
-    for d,g in df_to_forecast(df_raw).pipe(to_30min).groupby("date")
-], ignore_index=True)
-
-# Vardiya sayıları (daha optimal)
-shifts_week = plan_shifts_ilp(planned_week)
+# NOT: Hafta içi A kuyruğunu karşılama mantığı (Kısıt 2'de) B uzmanlarının esnekliğini kullanarak 
+# A'nın talebini karşılarken, B'nin talebi (Kısıt 1'de) zaten garantilenmiştir. 
+# Bu, "B'nin fazlası A'ya yardım eder" mantığının matematiksel optimizasyon ile yansımasıdır.
