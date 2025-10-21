@@ -1,173 +1,420 @@
-from pulp import *
-import pandas as pd
-from pyworkforce.queuing import ErlangC
+# =========================================================
+# MULTI-REASON THRESHOLD ANALYSIS (1D & 2D) — EXPLAINED
+# =========================================================
+# Bu paket, her "call reason" için olasılık → sınıf (0/1) dönüşümü
+# eşiklerini sistematik tarar ve en iyi eşiği (ya da precision≥hedef
+# altında en iyi recall) otomatik seçer. 1D ve 2D (overall ∧ reason)
+# seçenekleriyle çalışır; çoklu reason için toplu özet üretir.
+# =========================================================
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 import numpy as np
-import math
-
-# ----------------------------------------------------
-# 1. VERİ TANIMLAMA
-# ----------------------------------------------------
-
-# Çalışan Tanımları
-A_CALISANLARI = [f'A{i}' for i in range(1, 10)] # 9 A-Uzmanı
-B_CALISANLARI = [f'B{i}' for i in range(1, 7)]  # 6 B-Uzmanı
-TUM_CALISANLAR = A_CALISANLARI + B_CALISANLARI
-
-# Zaman ve Vardiya Tanımları
-VARDİYALAR = ['Sabah', 'Öğle', 'Gece'] # Her biri 8 saat sürer
-GUNLER_HAFTA = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz']
-HAFTA_SAYISI = 4
-HAFTA_SONU = ['Cmt', 'Paz']
-
-# Erlang C Parametreleri
-SERVICE_LEVEL_TARGET = 0.85  # %85 çağrının 20 saniyede cevaplanması
-MAX_DELAY = 20               # Saniye
-AHT_SECONDS = 300            # Ortalama işlem süresi: 300 saniye (5 dakika)
-HOURLY_INTERVAL_SECONDS = 3600 # 1 Saatlik zaman dilimi (Erlang C için)
-HOURS_PER_SHIFT = 8          # Bir vardiyadaki saat dilimi sayısı (8 saatlik vardiya)
-
-# Saatlik Çağrı Verisi (Varsayım: Vardiya başına gelen çağrıların 8 saate eşit dağılımı)
-SHIFT_CALLS = {
-    'A': { # Vardiya Başına Toplam Çağrı Sayısı (Eski veriniz)
-        'Sabah': {'Pzt': 80, 'Sal': 85, 'Çar': 90, 'Per': 95, 'Cum': 120, 'Cmt': 150, 'Paz': 140},
-        'Öğle':  {'Pzt': 140, 'Sal': 150, 'Çar': 160, 'Per': 170, 'Cum': 190, 'Cmt': 220, 'Paz': 200},
-        'Gece':  {'Pzt': 50, 'Sal': 55, 'Çar': 60, 'Per': 65, 'Cum': 70, 'Cmt': 75, 'Paz': 65}
-    },
-    'B': { # B Kuyruğu Trafiği
-        'Sabah': {'Pzt': 40, 'Sal': 45, 'Çar': 30, 'Per': 35, 'Cum': 45, 'Cmt': 20, 'Paz': 15},
-        'Öğle':  {'Pzt': 60, 'Sal': 65, 'Çar': 70, 'Per': 75, 'Cum': 80, 'Cmt': 50, 'Paz': 45},
-        'Gece':  {'Pzt': 5, 'Sal': 5, 'Çar': 5, 'Per': 5, 'Cum': 10, 'Cmt': 5, 'Paz': 5}
-    }
-}
-
-# ----------------------------------------------------
-# 2. AŞAMA: SAATLİK ERLANG C İLE DİNAMİK TALEP HESAPLAMA
-# ----------------------------------------------------
-
-erlang = ErlangC(
-    transactions=0, # Dinamik olarak ayarlanacak
-    aht=AHT_SECONDS, 
-    interval=HOURLY_INTERVAL_SECONDS, # 1 saatlik aralık
-    service_level=SERVICE_LEVEL_TARGET, 
-    max_delay=MAX_DELAY,
-    max_occupancy=0.85 
+import pandas as pd
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score, accuracy_score,
+    roc_auc_score, brier_score_loss
 )
+from sklearn.isotonic import IsotonicRegression
 
-MIN_DEMAND_PER_SHIFT = {'A': {}, 'B': {}}
+# ------------------------------
+# Küçük yardımcılar
+# ------------------------------
 
-for queue in ['A', 'B']:
-    MIN_DEMAND_PER_SHIFT[queue] = {v: {} for v in VARDİYALAR}
-    for v in VARDİYALAR:
-        for g in GUNLER_HAFTA:
-            total_shift_calls = SHIFT_CALLS[queue][v][g]
-            
-            # Her saatlik dilime düşen ortalama çağrı adedi
-            # Not: Gerçek modelde, bu verinin her saat için ayrı gelmesi gerekir.
-            hourly_calls_per_slot = total_shift_calls / HOURS_PER_SHIFT
-            
-            if hourly_calls_per_slot == 0:
-                max_required_agents = 0
-            else:
-                # 8 saatlik vardiyadaki her 1 saatlik dilim için hesaplama yaparız.
-                required_agents_list = []
-                for hour in range(HOURS_PER_SHIFT):
-                    # Tüm saatlerde eşit çağrı geldiği varsayımıyla hesapla
-                    
-                    # Erlang C, işlemleri integer bekler, çağrıları yuvarlayalım
-                    calls_in_slot = math.ceil(hourly_calls_per_slot)
-                    
-                    results = erlang.required_agents(transactions=calls_in_slot)
-                    
-                    # İhtiyaç duyulan personel sayısı her zaman yukarı yuvarlanır
-                    required_agents = int(np.ceil(results['required_agents']))
-                    required_agents_list.append(required_agents)
+def _bin(y_prob: np.ndarray, thr: float) -> np.ndarray:
+    """Olasılıkları eşiğe göre (>=thr) 0/1'e çevir."""
+    return (y_prob >= thr).astype(int)
 
-                # PuLP (Vardiya) modeline girdi olarak, o vardiyanın EN YÜKSEK saatlik personel ihtiyacını almalıyız.
-                max_required_agents = max(required_agents_list)
-            
-            MIN_DEMAND_PER_SHIFT[queue][v][g] = max_required_agents
+def _safe_precision(y_true, y_pred) -> float:
+    return precision_score(y_true, y_pred, zero_division=0)
 
-# Kontrol: Hesaplanan talebin bir kısmını yazdır
-print("\n--- Hesaplanan Maksimum Personel Talebi (Erlang C Saatlik Bazlı) ---")
-print(MIN_DEMAND_PER_SHIFT['A']['Sabah']) 
-print("---------------------------------------------------------------------")
+def _safe_recall(y_true, y_pred) -> float:
+    return recall_score(y_true, y_pred, zero_division=0)
 
-# ----------------------------------------------------
-# 3. AŞAMA: PuLP OPTİMİZASYON MODELİNİ OLUŞTURMA
-# ----------------------------------------------------
+def _prevalence(y_true: np.ndarray) -> float:
+    """Pozitif taban oranı (base rate)."""
+    return float(np.mean(y_true))
 
-# ... (KARAR DEĞİŞKENLERİ, AMAÇ FONKSİYONU ve KISITLAR, sadece Kısıt 2'de MIN_DEMAND_PER_SHIFT kullanılarak devam eder)
+def _lift(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """(Pozitif tahminlerdeki gerçek pozitif oranı) / (taban pozitif oranı)."""
+    if y_pred.sum() == 0:
+        return np.nan
+    pos_rate_pred = np.mean(y_true[y_pred == 1])
+    base = _prevalence(y_true)
+    return pos_rate_pred / base if base > 0 else np.nan
 
-model = LpProblem("Erlang_C_Saatlik_Rostering_Optimizasyonu", LpMinimize)
+# --------------------------------------------
+# 1D tarama: yalnızca reason olasılığı
+# --------------------------------------------
 
-# KARAR DEĞİŞKENLERİ
-X = LpVariable.dicts("Atama", (TUM_CALISANLAR, VARDİYALAR, range(1, HAFTA_SAYISI + 1), GUNLER_HAFTA), cat=LpBinary)
-Y = LpVariable.dicts("HS_Calisma", (TUM_CALISANLAR, range(1, HAFTA_SAYISI + 1)), cat=LpBinary)
+def sweep_thresholds_1d(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    grid: Optional[np.ndarray] = None
+) -> pd.DataFrame:
+    """
+    Tek değişkenli eşik taraması: y_pred = (y_prob >= t).
 
-# AMAÇ FONKSİYONU
-model += lpSum([X[c][v][h][g] for c in TUM_CALISANLAR for v in VARDİYALAR for h in range(1, HAFTA_SAYISI + 1) for g in GUNLER_HAFTA]), "Toplam_Atanan_Vardiya_Sayisi"
+    Dönüş: DataFrame (threshold, precision, recall, f1, accuracy, lift),
+    df.attrs içinde base_prevalence, roc_auc, brier özetleri.
+    """
+    if grid is None:
+        grid = np.round(np.linspace(0.0, 1.0, 201), 3)  # 0.005 adım
 
-# KISITLAR 
-# Kısıt 1: Bireysel Kapasite (Aynı kalır)
-for c in TUM_CALISANLAR:
-    for h in range(1, HAFTA_SAYISI + 1):
-        for g in GUNLER_HAFTA:
-            model += lpSum([X[c][v][h][g] for v in VARDİYALAR]) <= 1, f"Kisit_Tek_Vardiya_{c}_{h}_{g}"
+    rows = []
+    for thr in grid:
+        y_pred = _bin(y_prob, thr)
+        rows.append({
+            "threshold": thr,
+            "precision": _safe_precision(y_true, y_pred),
+            "recall":    _safe_recall(y_true, y_pred),
+            "f1":        f1_score(y_true, y_pred, zero_division=0),
+            "accuracy":  accuracy_score(y_true, y_pred),
+            "lift":      _lift(y_true, y_pred),
+        })
 
-# Kısıt 2: Dinamik Erlang C Talep Kısıtı (Yeni talep kaynağı kullanıldı)
-for v in VARDİYALAR:
-    for h in range(1, HAFTA_SAYISI + 1):
-        for g in GUNLER_HAFTA:
-            
-            A_talep = MIN_DEMAND_PER_SHIFT['A'][v][g] # Saatlik Max Talep
-            B_talep = MIN_DEMAND_PER_SHIFT['B'][v][g] 
-            
-            # B Kuyruğu Kısıtı
-            model += lpSum([X[c][v][h][g] for c in B_CALISANLARI]) >= B_talep, f"Kisit_Talep_B_{v}_{h}_{g}"
-            
-            # A Kuyruğu Kısıtı
-            if g in HAFTA_SONU:
-                model += lpSum([X[c][v][h][g] for c in A_CALISANLARI]) >= A_talep, f"Kisit_Talep_A_HS_{v}_{h}_{g}"
-            else:
-                model += lpSum([X[c][v][h][g] for c in TUM_CALISANLAR]) >= A_talep, f"Kisit_Talep_A_HI_{v}_{h}_{g}"
+    df = pd.DataFrame(rows)
+    df.attrs["base_prevalence"] = _prevalence(y_true)
+    try:    df.attrs["roc_auc"] = roc_auc_score(y_true, y_prob)
+    except: df.attrs["roc_auc"] = np.nan
+    try:    df.attrs["brier"] = brier_score_loss(y_true, y_prob)
+    except: df.attrs["brier"] = np.nan
+    return df
 
-# Kısıt 3: Maksimum Ardışık Vardiya (Aynı kalır)
-for c in TUM_CALISANLAR:
-    for h in range(1, HAFTA_SAYISI + 1):
-        for i in range(len(GUNLER_HAFTA) - 2): 
-            g1, g2, g3 = GUNLER_HAFTA[i], GUNLER_HAFTA[i+1], GUNLER_HAFTA[i+2]
-            model += lpSum([X[c][v][h][g1] for v in VARDİYALAR]) + lpSum([X[c][v][h][g2] for v in VARDİYALAR]) + lpSum([X[c][v][h][g3] for v in VARDİYALAR]) <= 2, f"Kisit_Max_2_Gun_Calisma_{c}_{h}_{g1}"
+# --------------------------------------------------------
+# 2D tarama: overall ∧ reason (precision'ı artırmak için)
+# --------------------------------------------------------
 
-# Kısıt 4: Aylık Haftasonu Kısıtı (KeyError düzeltmesi dahil)
-for c in TUM_CALISANLAR:
-    for h in range(1, HAFTA_SAYISI + 1):
-        haftasonu_vardiya_sayisi = lpSum([X[c][v][h][g] for v in VARDİYALAR for g in HAFTA_SONU])
-        # KEY ERROR DÜZELTMESİ: Y[(c, h)]
-        model += haftasonu_vardiya_sayisi <= len(HAFTA_SONU) * Y[(c, h)], f"Kisit_HS_Calisma_Yukari_{c}_{h}"
-        
-    model += lpSum([Y[(c, h)] for h in range(1, HAFTA_SAYISI + 1)]) <= HAFTA_SAYISI - 1, f"Kisit_Min_1_HS_Izin_{c}"
+def sweep_thresholds_2d(
+    y_true: np.ndarray,
+    p_overall: np.ndarray,
+    p_reason: np.ndarray,
+    grid_overall: Optional[np.ndarray] = None,
+    grid_reason: Optional[np.ndarray] = None
+) -> pd.DataFrame:
+    """
+    Çift kapı: y_pred = (p_overall >= t_overall) ∧ (p_reason >= t_reason).
+    """
+    if grid_overall is None:
+        grid_overall = np.round(np.linspace(0.0, 1.0, 21), 2)  # 0.05 adım
+    if grid_reason is None:
+        grid_reason  = np.round(np.linspace(0.0, 1.0, 21), 2)
 
-# Kısıt 5: Maksimum 6 Gün Çalışma (Aynı kalır)
-for c in TUM_CALISANLAR:
-    for h in range(1, HAFTA_SAYISI + 1):
-        haftalik_vardiya_sayisi = lpSum([X[c][v][h][g] for v in VARDİYALAR for g in GUNLER_HAFTA])
-        model += haftalik_vardiya_sayisi <= 6, f"Kisit_Maks_6_Gun_{c}_{h}"
+    rows = []
+    for t1 in grid_overall:
+        for t2 in grid_reason:
+            y_pred = ((p_overall >= t1) & (p_reason >= t2)).astype(int)
+            rows.append({
+                "t_overall": t1,
+                "t_reason":  t2,
+                "precision": _safe_precision(y_true, y_pred),
+                "recall":    _safe_recall(y_true, y_pred),
+                "f1":        f1_score(y_true, y_pred, zero_division=0),
+                "accuracy":  accuracy_score(y_true, y_pred),
+                "lift":      _lift(y_true, y_pred),
+            })
+    return pd.DataFrame(rows)
+
+# ---------------------------------------
+# Eşik seçimi stratejileri (otomatik)
+# ---------------------------------------
+
+@dataclass
+class ThresholdPick:
+    """Seçilmiş eşik(ler) ve metrik özeti."""
+    strategy: str
+    # 1D
+    threshold: Optional[float] = None
+    # 2D
+    t_overall: Optional[float] = None
+    t_reason:  Optional[float] = None
+    # metrics
+    precision: float = np.nan
+    recall:    float = np.nan
+    f1:        float = np.nan
+    accuracy:  float = np.nan
+    lift:      float = np.nan
+
+def pick_from_1d(df: pd.DataFrame, precision_floor: Optional[float] = None) -> Dict[str, ThresholdPick]:
+    """
+    1D seçim:
+      - best_f1
+      - precision≥hedef ise recall maks (yoksa en yüksek precision fallback)
+    """
+    picks: Dict[str, ThresholdPick] = {}
+
+    # best_f1
+    r = df.sort_values(["f1", "recall", "precision"], ascending=[False, False, False]).iloc[0]
+    picks["best_f1"] = ThresholdPick(
+        strategy="best_f1",
+        threshold=float(r.threshold),
+        precision=float(r.precision),
+        recall=float(r.recall),
+        f1=float(r.f1),
+        accuracy=float(r.accuracy),
+        lift=float(r.lift) if pd.notna(r.lift) else np.nan
+    )
+
+    if precision_floor is not None:
+        cand = df[df["precision"] >= precision_floor]
+        if len(cand):
+            r2 = cand.sort_values(["recall", "f1"], ascending=[False, False]).iloc[0]
+            key = f"precision>={precision_floor:.2f}"
+            picks[key] = ThresholdPick(
+                strategy=key,
+                threshold=float(r2.threshold),
+                precision=float(r2.precision),
+                recall=float(r2.recall),
+                f1=float(r2.f1),
+                accuracy=float(r2.accuracy),
+                lift=float(r2.lift) if pd.notna(r2.lift) else np.nan
+            )
+        else:
+            r3 = df.sort_values(["precision", "recall"], ascending=[False, False]).iloc[0]
+            key = f"precision~{precision_floor:.2f}_fallback"
+            picks[key] = ThresholdPick(
+                strategy=key,
+                threshold=float(r3.threshold),
+                precision=float(r3.precision),
+                recall=float(r3.recall),
+                f1=float(r3.f1),
+                accuracy=float(r3.accuracy),
+                lift=float(r3.lift) if pd.notna(r3.lift) else np.nan
+            )
+    return picks
+
+def pick_from_2d(df2: pd.DataFrame, precision_floor: Optional[float] = None) -> Dict[str, ThresholdPick]:
+    """
+    2D seçim:
+      - best_f1
+      - precision≥hedef ise recall maks (yoksa en yüksek precision fallback)
+    """
+    picks: Dict[str, ThresholdPick] = {}
+
+    r = df2.sort_values(["f1", "recall", "precision"], ascending=[False, False, False]).iloc[0]
+    picks["best_f1"] = ThresholdPick(
+        strategy="best_f1_2d",
+        t_overall=float(r.t_overall),
+        t_reason=float(r.t_reason),
+        precision=float(r.precision),
+        recall=float(r.recall),
+        f1=float(r.f1),
+        accuracy=float(r.accuracy),
+        lift=float(r.lift) if pd.notna(r.lift) else np.nan
+    )
+
+    if precision_floor is not None:
+        cand = df2[df2["precision"] >= precision_floor]
+        if len(cand):
+            r2 = cand.sort_values(["recall", "f1"], ascending=[False, False]).iloc[0]
+            key = f"precision>={precision_floor:.2f}_2d"
+            picks[key] = ThresholdPick(
+                strategy=key,
+                t_overall=float(r2.t_overall),
+                t_reason=float(r2.t_reason),
+                precision=float(r2.precision),
+                recall=float(r2.recall),
+                f1=float(r2.f1),
+                accuracy=float(r2.accuracy),
+                lift=float(r2.lift) if pd.notna(r2.lift) else np.nan
+            )
+        else:
+            r3 = df2.sort_values(["precision", "recall"], ascending=[False, False]).iloc[0]
+            key = f"precision~{precision_floor:.2f}_fallback_2d"
+            picks[key] = ThresholdPick(
+                strategy=key,
+                t_overall=float(r3.t_overall),
+                t_reason=float(r3.t_reason),
+                precision=float(r3.precision),
+                recall=float(r3.recall),
+                f1=float(r3.f1),
+                accuracy=float(r3.accuracy),
+                lift=float(r3.lift) if pd.notna(r3.lift) else np.nan
+            )
+    return picks
+
+# -------------------------------------------------
+# (Opsiyonel) Kalibrasyon — isotonic örneği
+# -------------------------------------------------
+
+def isotonic_calibrate(y_prob_valid: np.ndarray, y_true_valid: np.ndarray,
+                       y_prob_test: np.ndarray) -> np.ndarray:
+    """
+    VALID üzerinde isotonic ile kalibre et, TEST olasılıklarını dönüştür.
+    """
+    ir = IsotonicRegression(out_of_bounds="clip")
+    ir.fit(y_prob_valid, y_true_valid)
+    return ir.transform(y_prob_test)
+
+# -------------------------------------------------
+# Çoklu reason için üst seviye sarmallar (1D & 2D)
+# -------------------------------------------------
+
+def analyze_many_reasons_1d(
+    df: pd.DataFrame,
+    reason_map: Dict[str, Tuple[str, str]],
+    # ör: {"x1a": ("prob_x1a","flag_x1a"), "x2a": ("prob_x2a","flag_x2a"), ...}
+    precision_floor_by_reason: Optional[Dict[str, float]] = None,
+    grid: Optional[np.ndarray] = None
+) -> Tuple[Dict[str, Dict[str, object]], pd.DataFrame]:
+    """
+    Her reason için 1D tarama & seçim yapar.
+    Dönüş:
+      - results: {reason: {"metrics": df, "summary": {...}, "picks": {...}}}
+      - summary_df: reason başına satır (best_f1 ve varsa precision≥hedef)
+    """
+    all_results: Dict[str, Dict[str, object]] = {}
+    rows = []
+
+    for reason, (prob_col, flag_col) in reason_map.items():
+        y_prob = df[prob_col].values.astype(float)
+        y_true = df[flag_col].values.astype(int)
+
+        met = sweep_thresholds_1d(y_true, y_prob, grid=grid)
+        pf = None
+        if precision_floor_by_reason and reason in precision_floor_by_reason:
+            pf = float(precision_floor_by_reason[reason])
+        picks = pick_from_1d(met, precision_floor=pf)
+
+        # toplanacak özet
+        all_results[reason] = {
+            "metrics": met,
+            "summary": {
+                "base_prevalence": met.attrs.get("base_prevalence", np.nan),
+                "roc_auc": met.attrs.get("roc_auc", np.nan),
+                "brier": met.attrs.get("brier", np.nan)
+            },
+            "picks": picks
+        }
+
+        # Tabloya "best_f1" satırı
+        p1 = picks["best_f1"]
+        rows.append({
+            "reason": reason, "strategy": p1.strategy,
+            "threshold": p1.threshold, "precision": p1.precision,
+            "recall": p1.recall, "f1": p1.f1, "accuracy": p1.accuracy,
+            "lift": p1.lift,
+            "base_prev": met.attrs.get("base_prevalence", np.nan),
+            "roc_auc": met.attrs.get("roc_auc", np.nan),
+            "brier": met.attrs.get("brier", np.nan),
+        })
+
+        # Tabloya precision≥hedef satırı (varsa)
+        if pf is not None:
+            key = [k for k in picks.keys() if k.startswith("precision")][0]
+            p2 = picks[key]
+            rows.append({
+                "reason": reason, "strategy": p2.strategy,
+                "threshold": p2.threshold, "precision": p2.precision,
+                "recall": p2.recall, "f1": p2.f1, "accuracy": p2.accuracy,
+                "lift": p2.lift,
+                "base_prev": met.attrs.get("base_prevalence", np.nan),
+                "roc_auc": met.attrs.get("roc_auc", np.nan),
+                "brier": met.attrs.get("brier", np.nan),
+            })
+
+    summary_df = pd.DataFrame(rows).sort_values(["reason", "strategy"]).reset_index(drop=True)
+    return all_results, summary_df
 
 
-# ----------------------------------------------------
-# 4. AŞAMA: MODELİ ÇÖZME VE SONUÇLARI GÖRÜNTÜLEME
-# ----------------------------------------------------
+def analyze_many_reasons_2d(
+    df: pd.DataFrame,
+    reason_map_2d: Dict[str, Tuple[str, str, str]],
+    # ör: {"x1a": ("prob_call_overall","prob_x1a","flag_x1a"), ...}
+    precision_floor_by_reason: Optional[Dict[str, float]] = None,
+    grid_overall: Optional[np.ndarray] = None,
+    grid_reason: Optional[np.ndarray] = None
+) -> Tuple[Dict[str, Dict[str, object]], pd.DataFrame]:
+    """
+    Her reason için 2D tarama & seçim yapar (overall ∧ reason).
+    Dönüş:
+      - results: {reason: {"metrics_2d": df, "picks_2d": {...}}}
+      - summary_df: reason başına satır (best_f1_2d ve varsa precision≥hedef_2d)
+    """
+    all_results: Dict[str, Dict[str, object]] = {}
+    rows = []
 
-print("\nModel Çözülüyor...")
-model.solve()
+    for reason, (overall_col, prob_col, flag_col) in reason_map_2d.items():
+        y_true   = df[flag_col].values.astype(int)
+        p_all    = df[overall_col].values.astype(float)
+        p_reason = df[prob_col].values.astype(float)
 
-# ATTRIBUTE ERROR DÜZELTMESİ: model.status == 1 kontrolü
-print(f"\nÇözüm Durumu: {LpStatus[model.status]}")
+        met2 = sweep_thresholds_2d(y_true, p_all, p_reason, grid_overall, grid_reason)
+        pf = None
+        if precision_floor_by_reason and reason in precision_floor_by_reason:
+            pf = float(precision_floor_by_reason[reason])
+        picks2 = pick_from_2d(met2, precision_floor=pf)
 
-if model.status == 1: 
-    print(f"Minimum Toplam Atanan Vardiya Sayısı (4 Haftalık): {value(model.objective):.0f}")
-    print("Çözüm Başarılı! Atamalar yapılmıştır.")
-    # ... (Geri kalan sonuç yazdırma kodu buraya devam etmeli)
-    
-else:
-    print(f"Optimal bir çözüm bulunamadı. Çözüm durumu: {LpStatus[model.status]}")
+        all_results[reason] = {"metrics_2d": met2, "picks_2d": picks2}
+
+        # best_f1_2d
+        p1 = picks2["best_f1_2d"]
+        rows.append({
+            "reason": reason, "strategy": p1.strategy,
+            "t_overall": p1.t_overall, "t_reason": p1.t_reason,
+            "precision": p1.precision, "recall": p1.recall,
+            "f1": p1.f1, "accuracy": p1.accuracy, "lift": p1.lift
+        })
+
+        # precision≥hedef_2d (varsa)
+        if pf is not None:
+            key = [k for k in picks2.keys() if k.startswith("precision")][0]
+            p2 = picks2[key]
+            rows.append({
+                "reason": reason, "strategy": p2.strategy,
+                "t_overall": p2.t_overall, "t_reason": p2.t_reason,
+                "precision": p2.precision, "recall": p2.recall,
+                "f1": p2.f1, "accuracy": p2.accuracy, "lift": p2.lift
+            })
+
+    summary_df = pd.DataFrame(rows).sort_values(["reason", "strategy"]).reset_index(drop=True)
+    return all_results, summary_df
+
+
+# ======================
+# ÖRNEK KULLANIM (mini)
+# ======================
+if __name__ == "__main__":
+    # Örnek: 2 reason (x1a, x2a). Wide şema:
+    # prob_x1a, flag_x1a, prob_x2a, flag_x2a, ve genel: prob_call_overall
+    demo = pd.DataFrame({
+        "musteri_id": [1,2,3,4,5,6,7,8],
+        "prob_call_overall": [0.90,0.80,0.60,0.40,0.30,0.20,0.15,0.05],
+        "prob_x1a": [0.82,0.77,0.60,0.55,0.35,0.22,0.18,0.05],
+        "flag_x1a": [1,1,1,0,0,0,0,0],
+        "prob_x2a": [0.10,0.20,0.25,0.40,0.50,0.70,0.90,0.95],
+        "flag_x2a": [0,0,0,0,1,1,1,1],
+    })
+
+    # --- 1D: her reason için farklı eşik seç (best_f1 + precision≥hedef) ---
+    reason_map_1d = {
+        "x1a": ("prob_x1a", "flag_x1a"),
+        "x2a": ("prob_x2a", "flag_x2a"),
+    }
+    precision_targets = {
+        "x1a": 0.75,   # ör: x1a'da 0.75+ precision isterim
+        "x2a": 0.98,   # ör: x2a'da 0.98+ precision isterim
+    }
+    results_1d, summary_1d = analyze_many_reasons_1d(
+        df=demo,
+        reason_map=reason_map_1d,
+        precision_floor_by_reason=precision_targets,
+        grid=None   # default 0.005 adımlı grid
+    )
+    print("\n[1D] Reason bazlı özet:")
+    print(summary_1d)
+
+    # --- 2D: overall ∧ reason eşikleri (genelde precision artar) ---
+    reason_map_2d = {
+        "x1a": ("prob_call_overall", "prob_x1a", "flag_x1a"),
+        "x2a": ("prob_call_overall", "prob_x2a", "flag_x2a"),
+    }
+    results_2d, summary_2d = analyze_many_reasons_2d(
+        df=demo,
+        reason_map_2d=reason_map_2d,
+        precision_floor_by_reason=precision_targets,
+        grid_overall=None,  # default 0.05 adım
+        grid_reason=None
+    )
+    print("\n[2D] Reason bazlı özet:")
+    print(summary_2d)
