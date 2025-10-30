@@ -1,69 +1,40 @@
 import pandas as pd
 import numpy as np
 
-# 0) Sütunları uyumlu isme getir
-df = df.rename(columns={
-    "Müşteri id": "customer_id",
-    "Arama ihtimali proba": "prob_overall",
-    "Arama nedeni": "call_reason",
-    "Arama nedeni ihtimali": "prob_reason",
-    "O sebeple mi aradı flg": "reason_flag",
-})
+# === Parametreler ===
+precision_floor = 0.60       # minimum precision
+min_pred_count  = 1000       # en az 1000 tahmin edilen kişi
+prob_threshold  = 0.70       # proba > 0.70
+results = []
 
-# 1) Long → Wide: her reason için ayrı kolon üret (aynı sayıda satırla hizalamak için sıra numarası ver)
-df = df.copy()
-df["row_in_reason"] = df.groupby("call_reason").cumcount()
+# reason bazlı döngü
+for reason in reason_map_1d.keys():
+    prob_col = f"prob_{reason}"
+    flag_col = f"flag_{reason}"
 
-# prob_reason → prob_<reason>
-prob_wide   = df.pivot(index="row_in_reason", columns="call_reason", values="prob_reason")
-prob_wide   = prob_wide.add_prefix("prob_")
+    # 1) Yalnızca %70 üzeri olasılıkları filtrele
+    sub = df_wide[df_wide[prob_col] >= prob_threshold].copy()
 
-# reason_flag → flag_<reason>
-flag_wide   = df.pivot(index="row_in_reason", columns="call_reason", values="reason_flag")
-flag_wide   = flag_wide.add_prefix("flag_")
+    # 2) Toplam tahmin edilen kişi sayısı
+    pred_count = len(sub)
 
-# prob_overall → overall_<reason>  (2D için gerekiyor)
-overall_wide = df.pivot(index="row_in_reason", columns="call_reason", values="prob_overall")
-overall_wide = overall_wide.add_prefix("overall_")
+    # 3) Gerçekten o reason’dan arayan sayısı
+    true_count = sub[flag_col].sum()
 
-# Tek wide DF
-df_wide = pd.concat([prob_wide, flag_wide, overall_wide], axis=1).sort_index().reset_index(drop=True)
+    # 4) Precision ve Recall hesapla
+    precision = true_count / pred_count if pred_count > 0 else np.nan
+    recall = true_count / df_wide[flag_col].sum() if df_wide[flag_col].sum() > 0 else np.nan
 
-# 2) reason listesi ve haritalar
-reasons = prob_wide.columns.str.replace("^prob_", "", regex=True).tolist()
+    # 5) Filtre: precision ≥ 0.60 ve pred_count ≥ 1000
+    if precision >= precision_floor and pred_count >= min_pred_count:
+        results.append({
+            "reason": reason,
+            "precision": precision,
+            "recall": recall,
+            "pred_count": pred_count,
+            "true_count": true_count
+        })
 
-# analyze_many_reasons_1d için: {"x1a": ("prob_x1a","flag_x1a"), ...}
-reason_map_1d = {r: (f"prob_{r}", f"flag_{r}") for r in reasons}
-
-# analyze_many_reasons_2d için: {"x1a": ("overall_x1a","prob_x1a","flag_x1a"), ...}
-reason_map_2d = {r: (f"overall_{r}", f"prob_{r}", f"flag_{r}") for r in reasons}
-
-# 3) Çalıştır (precision hedefi istersen ver; istemezsen None bırak)
-precision_targets = None   # örn: {"x1a": 0.75, "x2a": 0.98}
-
-# ---- 1D ----
-all_results_1d, summary_1d = analyze_many_reasons_1d(
-    df=df_wide,
-    reason_map=reason_map_1d,
-    precision_floor_by_reason=precision_targets,
-    grid=None  # varsayılan 0..1 sık grid
-)
-
-# ---- 2D ----
-all_results_2d, summary_2d = analyze_many_reasons_2d(
-    df=df_wide,
-    reason_map_2d=reason_map_2d,
-    precision_floor_by_reason=precision_targets,
-    grid_overall=None, grid_reason=None
-)
-
-# 4) Hızlı bakış
-print("=== 1D Özet ===")
-print(summary_1d.head(10))
-print("\n=== 2D Özet ===")
-print(summary_2d.head(10))
-
-# Örnek: bir reason için seçilen en iyi eşiğe erişim
-r0 = reasons[0]
-print("\n1D best_f1 ->", all_results_1d[r0]["picks"]["best_f1"])
-print("2D best_f1_2d ->", all_results_2d[r0]["picks_2d"]["best_f1_2d"])
+# === Sonuç tablosu ===
+summary_filtered = pd.DataFrame(results).sort_values("precision", ascending=False)
+print(summary_filtered)
