@@ -1,40 +1,211 @@
 import pandas as pd
 import numpy as np
+from typing import Dict, Tuple, Optional
 
-# === Parametreler ===
-precision_floor = 0.60       # minimum precision
-min_pred_count  = 1000       # en az 1000 tahmin edilen kişi
-prob_threshold  = 0.70       # proba > 0.70
-results = []
+# -------------------------------------------------------------------
+# BEKLENEN KOLONLAR
+# -------------------------------------------------------------------
+# customer_id           : Müşteri ID
+# call_prob             : Arama ihtimali (overall) proba  [0-1]
+# reason_pred           : Modelin tahmin ettiği arama nedeni (kategori/string)
+# reason_prob           : Tahmin ettiği bu nedenin proba'sı [0-1]
+# reason_true_flg       : Gerçekte o nedenle aramış mı? (1/0 ya da True/False)
+#
+# Not: reason_true_flg boolean değilse 1/0’a çevrilir.
 
-# reason bazlı döngü
-for reason in reason_map_1d.keys():
-    prob_col = f"prob_{reason}"
-    flag_col = f"flag_{reason}"
+def _ensure_binary(x):
+    """reason_true_flg kolonunu 1/0'a normalize et."""
+    if x.dtype == bool:
+        return x.astype(int)
+    if np.issubdtype(x.dtype, np.number):
+        return (x > 0).astype(int)
+    # string vb.
+    return x.astype(str).str.strip().isin(["1", "true", "True", "YES", "yes"]).astype(int)
 
-    # 1) Yalnızca %70 üzeri olasılıkları filtrele
-    sub = df_wide[df_wide[prob_col] >= prob_threshold].copy()
 
-    # 2) Toplam tahmin edilen kişi sayısı
-    pred_count = len(sub)
+def optimize_thresholds_per_reason(
+    df: pd.DataFrame,
+    *,
+    min_count: int = 500,
+    base_call_floor: float = 0.70,
+    shared_threshold: bool = True,
+    # shared_threshold=True ise, aynı t hem call_prob’a hem reason_prob’a uygulanır.
+    # False ise call_prob ve reason_prob için ayrı en iyi t’ler aranır.
+    grid_step: float = 0.01,
+    reasons: Optional[list] = None
+) -> pd.DataFrame:
+    """
+    Her arama nedeni için (base_call_floor ile filtreledikten sonra) en yüksek precision'ı
+    veren eşik(leri) bulur. Min 500 kişi şartı sağlanamazsa, en yüksek precision'lı
+    kombinasyonu 'fallback' olarak seçer ve 'fallback' kolonu True olur.
+    """
+    # Güvenlik: kolon isimleri
+    required_cols = ["customer_id", "call_prob", "reason_pred", "reason_prob", "reason_true_flg"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Eksik kolon(lar): {missing}")
 
-    # 3) Gerçekten o reason’dan arayan sayısı
-    true_count = sub[flag_col].sum()
+    data = df.copy()
+    data["reason_true_flg"] = _ensure_binary(data["reason_true_flg"])
 
-    # 4) Precision ve Recall hesapla
-    precision = true_count / pred_count if pred_count > 0 else np.nan
-    recall = true_count / df_wide[flag_col].sum() if df_wide[flag_col].sum() > 0 else np.nan
+    # Ön filtre: sadece call_prob >= base_call_floor olanlar
+    base = data.loc[data["call_prob"] >= base_call_floor].copy()
+    if base.empty:
+        raise ValueError(f"Filtre sonrası satır yok: call_prob >= {base_call_floor}")
 
-    # 5) Filtre: precision ≥ 0.60 ve pred_count ≥ 1000
-    if precision >= precision_floor and pred_count >= min_pred_count:
-        results.append({
-            "reason": reason,
-            "precision": precision,
-            "recall": recall,
-            "pred_count": pred_count,
-            "true_count": true_count
+    # Çalışılacak neden listesi
+    if reasons is None:
+        reasons = sorted(base["reason_pred"].dropna().unique().tolist())
+
+    # Grid oluştur (kandid eşikler)
+    def grid(vals, low=0.0):
+        lo = max(low, 0.0)
+        return np.round(np.arange(lo, 1.0 + 1e-9, grid_step), 4)
+
+    call_grid   = grid(np.array([]), low=base_call_floor)
+    reason_grid = grid(np.array([]), low=0.0)
+
+    summaries = []
+
+    for r in reasons:
+        sub = base.loc[base["reason_pred"] == r].copy()
+        if sub.empty:
+            summaries.append({
+                "reason": r,
+                "call_prob_best_th": np.nan,
+                "reason_prob_best_th": np.nan,
+                "predicted_count": 0,
+                "true_positives": 0,
+                "precision": np.nan,
+                "fallback": True
+            })
+            continue
+
+        best = {
+            "precision": -1.0,
+            "predicted_count": 0,
+            "true_positives": 0,
+            "call_t": np.nan,
+            "reason_t": np.nan,
+            "fallback": True
+        }
+
+        # Vektörel hız: değerleri numpy'a al
+        call_vals   = sub["call_prob"].to_numpy()
+        reason_vals = sub["reason_prob"].to_numpy()
+        y_true      = sub["reason_true_flg"].to_numpy().astype(int)
+
+        if shared_threshold:
+            # Tek eşik t hem call_prob hem reason_prob için kullanılacak
+            for t in reason_grid:  # 0.00..1.00 ama base_call_floor zaten filtrede var
+                mask = (call_vals >= t) & (reason_vals >= t)
+                n = int(mask.sum())
+                if n == 0:
+                    continue
+                tp = int(y_true[mask].sum())
+                prec = tp / n if n > 0 else 0.0
+
+                # Önce min_count şartını sağlayanlar içinde max precision
+                # Yoksa (fallback) en yüksek precision’ı tut
+                qualifies = n >= min_count
+                better = False
+                if qualifies and (best["fallback"] or prec > best["precision"]):
+                    better = True
+                elif not qualifies and best["fallback"] and (prec > best["precision"]):
+                    better = True
+                elif prec == best["precision"]:
+                    # Eşitlikte daha çok TP, sonra daha az kişi, sonra daha yüksek t
+                    if tp > best["true_positives"]:
+                        better = True
+                    elif tp == best["true_positives"] and n < best["predicted_count"]:
+                        better = True
+                    elif tp == best["true_positives"] and n == best["predicted_count"] and t > (best["call_t"] if not np.isnan(best["call_t"]) else -1):
+                        better = True
+
+                if better:
+                    best.update({
+                        "precision": prec,
+                        "predicted_count": n,
+                        "true_positives": tp,
+                        "call_t": t,
+                        "reason_t": t,
+                        "fallback": not qualifies
+                    })
+        else:
+            # Ayrı eşikler: call_prob için t_c, reason_prob için t_r
+            for t_c in call_grid:
+                # call filtresini önden uygula ki reason taraması hızlansın
+                mask_c = (call_vals >= t_c)
+                if not mask_c.any():
+                    continue
+                y_c = y_true[mask_c]
+                reason_c = reason_vals[mask_c]
+
+                for t_r in reason_grid:
+                    mask = mask_c.copy()
+                    mask[mask_c] = reason_c >= t_r
+                    n = int(mask.sum())
+                    if n == 0:
+                        continue
+                    tp = int(y_true[mask].sum())
+                    prec = tp / n if n > 0 else 0.0
+
+                    qualifies = n >= min_count
+                    better = False
+                    if qualifies and (best["fallback"] or prec > best["precision"]):
+                        better = True
+                    elif not qualifies and best["fallback"] and (prec > best["precision"]):
+                        better = True
+                    elif prec == best["precision"]:
+                        if tp > best["true_positives"]:
+                            better = True
+                        elif tp == best["true_positives"] and n < best["predicted_count"]:
+                            better = True
+                        elif tp == best["true_positives"] and n == best["predicted_count"] and (t_c + t_r) > ((best["call_t"] or 0) + (best["reason_t"] or 0)):
+                            better = True
+
+                    if better:
+                        best.update({
+                            "precision": prec,
+                            "predicted_count": n,
+                            "true_positives": tp,
+                            "call_t": t_c,
+                            "reason_t": t_r,
+                            "fallback": not qualifies
+                        })
+
+        summaries.append({
+            "reason": r,
+            "call_prob_best_th": best["call_t"],
+            "reason_prob_best_th": best["reason_t"],
+            "predicted_count": best["predicted_count"],
+            "true_positives": best["true_positives"],
+            "precision": np.round(best["precision"], 6) if best["precision"] >= 0 else np.nan,
+            "fallback": best["fallback"]
         })
 
-# === Sonuç tablosu ===
-summary_filtered = pd.DataFrame(results).sort_values("precision", ascending=False)
-print(summary_filtered)
+    out = pd.DataFrame(summaries).sort_values(["fallback", "precision"], ascending=[True, False]).reset_index(drop=True)
+    return out
+
+
+# ------------------------------------------------------------
+# KULLANIM ÖRNEĞİ
+# ------------------------------------------------------------
+# df = ...  # yukarıdaki kolon adlarıyla senin tablon
+# result = optimize_thresholds_per_reason(
+#     df,
+#     min_count=500,
+#     base_call_floor=0.70,
+#     shared_threshold=True,   # İLK İSTEK: tek bir eşik hem call_prob hem reason_prob için
+#     grid_step=0.01           # 0.01 adımla tarama (0.005 de yapabilirsin)
+# )
+# print(result)
+#
+# ÇIKTI KOLONLARI:
+# - reason                          : arama nedeni
+# - call_prob_best_th               : arama ihtimali için en iyi eşik
+# - reason_prob_best_th             : arama nedeni proba için en iyi eşik
+# - predicted_count                 : bu eşiklerle “tahmin ettim” dediğimiz kişi sayısı
+# - true_positives                  : gerçekten o nedenle arayan kişi sayısı (TP)
+# - precision                       : TP / predicted_count
+# - fallback                        : True ise min_count sağlanamadı; en iyi precision’lı kombinasyon seçildi
