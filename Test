@@ -30,4 +30,94 @@ def optimize_threshold_reason1_only(
 
     # Çalışılacak reason listesi
     if reasons is None:
-        reasons = sorted(data["true_reason"]_]()
+        reasons = sorted(data["true_reason"].dropna().astype(str).unique().tolist())
+
+    grid = np.round(np.arange(0.0, 1.0 + 1e-9, grid_step), 4)
+
+    def _count(mask, ids, uniq): 
+        return int(pd.Series(ids[mask]).nunique()) if uniq else int(mask.sum())
+
+    def _tp(mask, ids, y_true, uniq):
+        if uniq:
+            d = pd.DataFrame({"id": ids[mask], "y": y_true[mask]})
+            if d.empty: return 0
+            return int(d.groupby("id")["y"].max().sum())   # müşteri bazında en az bir doğru
+        else:
+            return int(y_true[mask].sum())
+
+    rows = []
+    ids_all = data["customer_id"].to_numpy()
+    r1_prob = data["reason1_prob"].to_numpy()
+
+    for r in reasons:
+        y_true = (data["true_reason"].astype(str) == str(r)).to_numpy().astype(int)
+        r1_pred_eq = (data["reason1_pred"].astype(str) == str(r)).to_numpy()
+
+        best = dict(t=np.nan, n=0, tp=0, prec=-1.0, fallback=True)
+
+        for t in grid:
+            mask = r1_pred_eq & (r1_prob >= t)
+            n  = _count(mask, ids_all, unique_customers)
+            if n == 0:
+                continue
+            tp = _tp(mask, ids_all, y_true, unique_customers)
+            prec = tp / n if n else 0.0
+            qualifies = n >= min_count
+
+            better = False
+            if qualifies and (best["fallback"] or prec > best["prec"]):
+                better = True
+            elif not qualifies and best["fallback"] and (prec > best["prec"]):
+                better = True
+            elif prec == best["prec"]:
+                if tp > best["tp"]:
+                    better = True
+                elif tp == best["tp"] and n < best["n"]:
+                    better = True
+                elif tp == best["tp"] and n == best["n"] and t > (best["t"] if not np.isnan(best["t"]) else -1):
+                    better = True
+
+            if better:
+                best.update(dict(t=t, n=n, tp=tp, prec=prec, fallback=not qualifies))
+
+        rows.append({
+            "reason": r,
+            "reason1_best_th": best["t"],
+            "predicted_count": best["n"],
+            "true_positives": best["tp"],
+            "precision": (round(best["prec"], 6) if best["prec"] >= 0 else np.nan),
+            "fallback": best["fallback"]
+        })
+
+    return pd.DataFrame(rows).sort_values(["fallback","precision"], ascending=[True,False]).reset_index(drop=True)
+
+# ---------------------------
+# 2) df yoksa örnek oluştur (df varsa bunu atlar)
+# ---------------------------
+try:
+    df
+except NameError:
+    df = pd.DataFrame({
+        "customer_id": [1,2,3,4,5,6,7,8,9,10],
+        "reason1_pred": ["ürün iadesi","adres değişikliği","ürün iadesi","limit artırımı","ürün iadesi",
+                         "adres değişikliği","limit artırımı","ürün iadesi","adres değişikliği","limit artırımı"],
+        "reason1_prob": [0.92,0.81,0.66,0.74,0.88,0.57,0.63,0.95,0.79,0.70],
+        "true_reason":  ["ürün iadesi","adres değişikliği","ürün iadesi","limit artırımı","adres değişikliği",
+                         "adres değişikliği","limit artırımı","ürün iadesi","ürün iadesi","limit artırımı"]
+    })
+    # Demo küçük olduğu için min_count'u küçük tutacağız; gerçek veride 500+ kullan
+    DEMO = True
+else:
+    DEMO = False
+
+# ---------------------------
+# 3) Çalıştır ve sonucu gör
+# ---------------------------
+result = optimize_threshold_reason1_only(
+    df,
+    min_count=(5 if DEMO else 500),  # örnekte küçük, gerçekte 500
+    grid_step=0.01,
+    unique_customers=True
+)
+
+print(result.to_string(index=False))
