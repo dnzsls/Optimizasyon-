@@ -2,65 +2,84 @@ import pandas as pd
 import numpy as np
 from typing import Optional, List
 
-# ---------------------------
-# 1) Fonksiyon
-# ---------------------------
-def optimize_threshold_reason1_only(
+def optimize_threshold_reason1_grouped(
     df: pd.DataFrame,
     *,
-    min_count: int = 500,
-    grid_step: float = 0.01,
-    reasons: Optional[List[str]] = None,
-    unique_customers: bool = True
+    min_count: int = 500,                 # en az kaç birim (müşteri veya müşteri-gün)
+    grid_step: float = 0.01,              # eşik aralığı (0.00..1.00)
+    base_call_floor: Optional[float] = 0.70,  # None => call_prob filtresi yok
+    session_cols: Optional[List[str]] = None, # tekillik anahtarı (varsayılan: sadece customer_id)
+    reasons: Optional[List[str]] = None        # None => true_reason’dan türet
 ) -> pd.DataFrame:
     """
-    call_prob'u tamamen dışarıda bırakır; sadece reason1 üzerinden threshold seçer.
-    Beklenen kolonlar: customer_id, reason1_pred, reason1_prob, true_reason
+    Tek tahminli senaryo (reason1_pred, reason1_prob):
+      - Birim = session_cols ile tanımlanır (örn. ["customer_id"] ya da ["customer_id","call_day"])
+      - Birim 'yakalandı' ⇔ o birimde en az bir satırda (reason1_pred == r) & (reason1_prob >= t)
+      - Birim 'doğru' ⇔ o birimde en az bir satırda (true_reason == r)
+      - Precision = TP / PredictedUnits (birim bazında).
+      - min_count kısıtı sağlananlar içinde precision’ı maksimize eden t seçilir.
+
+    Gerekli kolonlar:
+      customer_id, reason1_pred, reason1_prob, true_reason
+      (base_call_floor != None ise) call_prob
     """
-    required = ["customer_id", "reason1_pred", "reason1_prob", "true_reason"]
-    miss = [c for c in required if c not in df.columns]
+    must = ["customer_id", "reason1_pred", "reason1_prob", "true_reason"]
+    miss = [c for c in must if c not in df.columns]
     if miss:
         raise ValueError(f"Eksik kolon(lar): {miss}")
+    if base_call_floor is not None and "call_prob" not in df.columns:
+        raise ValueError("base_call_floor kullanacaksan 'call_prob' kolonu gerekli. Ya call_prob ekle ya da base_call_floor=None yap.")
 
     data = df.copy()
-
-    # (Öneri) metin normalizasyonu
+    # metin normalizasyonu (opsiyonel ama faydalı)
     for c in ["reason1_pred", "true_reason"]:
         data[c] = data[c].astype(str).str.strip()
 
-    # Çalışılacak reason listesi
+    # opsiyonel arama ihtimali taban filtresi
+    if base_call_floor is not None:
+        data = data.loc[data["call_prob"] >= float(base_call_floor)].copy()
+        if data.empty:
+            return pd.DataFrame(columns=["reason","call_prob_floor","reason1_best_th",
+                                         "predicted_units","true_positives","precision","fallback"])
+
+    # tekillik anahtarı (müşteri veya müşteri-gün)
+    if session_cols is None:
+        session_cols = ["customer_id"]
+    unit_key = data[session_cols].astype(str).agg("§".join, axis=1)
+    data = data.assign(_unit=unit_key.values)
+
+    # çalışılacak reason kümesi
     if reasons is None:
-        reasons = sorted(data["true_reason"].dropna().astype(str).unique().tolist())
+        reasons = sorted(data["true_reason"].dropna().unique().tolist())
 
     grid = np.round(np.arange(0.0, 1.0 + 1e-9, grid_step), 4)
 
-    def _count(mask, ids, uniq): 
-        return int(pd.Series(ids[mask]).nunique()) if uniq else int(mask.sum())
+    # yardımcı: satır maskesini birim düzeyine “any” ile indirgeme
+    def any_by_unit(mask_bool: np.ndarray) -> pd.Series:
+        return pd.Series(mask_bool, index=data.index).groupby(data["_unit"]).any()
 
-    def _tp(mask, ids, y_true, uniq):
-        if uniq:
-            d = pd.DataFrame({"id": ids[mask], "y": y_true[mask]})
-            if d.empty: return 0
-            return int(d.groupby("id")["y"].max().sum())   # müşteri bazında en az bir doğru
-        else:
-            return int(y_true[mask].sum())
-
-    rows = []
-    ids_all = data["customer_id"].to_numpy()
-    r1_prob = data["reason1_prob"].to_numpy()
+    results = []
 
     for r in reasons:
-        y_true = (data["true_reason"].astype(str) == str(r)).to_numpy().astype(int)
-        r1_pred_eq = (data["reason1_pred"].astype(str) == str(r)).to_numpy()
+        r_eq = (data["reason1_pred"] == r).to_numpy()
+        p    = data["reason1_prob"].to_numpy()
+        yrow = (data["true_reason"] == r).to_numpy()
+
+        # birim bazında ground-truth: o birimde en az bir doğru satır var mı?
+        y_unit_true = pd.Series(yrow, index=data.index).groupby(data["_unit"]).any()
 
         best = dict(t=np.nan, n=0, tp=0, prec=-1.0, fallback=True)
 
         for t in grid:
-            mask = r1_pred_eq & (r1_prob >= t)
-            n  = _count(mask, ids_all, unique_customers)
+            # tahmin maskesi (satır): r tahmin edildi VE prob ≥ t
+            m = r_eq & (p >= t)
+            # birim düzeyi: o birimde en az bir satır bu koşulu sağlıyor mu?
+            pred_unit = any_by_unit(m)
+
+            n = int(pred_unit.sum())                # tahmin edilen birim sayısı
             if n == 0:
                 continue
-            tp = _tp(mask, ids_all, y_true, unique_customers)
+            tp = int((pred_unit & y_unit_true).sum())  # doğru yakalanan birim sayısı
             prec = tp / n if n else 0.0
             qualifies = n >= min_count
 
@@ -80,44 +99,15 @@ def optimize_threshold_reason1_only(
             if better:
                 best.update(dict(t=t, n=n, tp=tp, prec=prec, fallback=not qualifies))
 
-        rows.append({
+        results.append({
             "reason": r,
+            "call_prob_floor": (None if base_call_floor is None else float(base_call_floor)),
             "reason1_best_th": best["t"],
-            "predicted_count": best["n"],
+            "predicted_units": best["n"],       # birim sayısı (müşteri veya müşteri-gün)
             "true_positives": best["tp"],
-            "precision": (round(best["prec"], 6) if best["prec"] >= 0 else np.nan),
+            "precision": (np.round(best["prec"], 6) if best["prec"] >= 0 else np.nan),
             "fallback": best["fallback"]
         })
 
-    return pd.DataFrame(rows).sort_values(["fallback","precision"], ascending=[True,False]).reset_index(drop=True)
-
-# ---------------------------
-# 2) df yoksa örnek oluştur (df varsa bunu atlar)
-# ---------------------------
-try:
-    df
-except NameError:
-    df = pd.DataFrame({
-        "customer_id": [1,2,3,4,5,6,7,8,9,10],
-        "reason1_pred": ["ürün iadesi","adres değişikliği","ürün iadesi","limit artırımı","ürün iadesi",
-                         "adres değişikliği","limit artırımı","ürün iadesi","adres değişikliği","limit artırımı"],
-        "reason1_prob": [0.92,0.81,0.66,0.74,0.88,0.57,0.63,0.95,0.79,0.70],
-        "true_reason":  ["ürün iadesi","adres değişikliği","ürün iadesi","limit artırımı","adres değişikliği",
-                         "adres değişikliği","limit artırımı","ürün iadesi","ürün iadesi","limit artırımı"]
-    })
-    # Demo küçük olduğu için min_count'u küçük tutacağız; gerçek veride 500+ kullan
-    DEMO = True
-else:
-    DEMO = False
-
-# ---------------------------
-# 3) Çalıştır ve sonucu gör
-# ---------------------------
-result = optimize_threshold_reason1_only(
-    df,
-    min_count=(5 if DEMO else 500),  # örnekte küçük, gerçekte 500
-    grid_step=0.01,
-    unique_customers=True
-)
-
-print(result.to_string(index=False))
+    out = pd.DataFrame(results).sort_values(["fallback","precision"], ascending=[True,False]).reset_index(drop=True)
+    return out
