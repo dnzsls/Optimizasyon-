@@ -2,95 +2,89 @@ import pandas as pd
 import numpy as np
 from typing import Optional, List
 
-def optimize_thresholds_reason12_or(
+def optimize_threshold_reason1_only(
     df: pd.DataFrame,
     *,
-    min_count: int = 500,
-    base_call_floor: float = 0.70,
-    grid_step: float = 0.01,
+    min_count: int = 500,        # en az kaç müşteri olmalı
+    grid_step: float = 0.01,     # eşik aralığı (0.00..1.00)
     reasons: Optional[List[str]] = None,
     unique_customers: bool = True
 ) -> pd.DataFrame:
     """
-    Arama ihtimali, reason1 ve reason2'yi OR (ya 1'de ya 2'de yakalandıysa doğru) olarak değerlendirir.
+    Sadece reason1_pred/reason1_prob ve true_reason'a bakarak
+    her true_reason için reason1_best_th eşiğini seçer (precision maks., min_count kısıtı).
+    
+    Beklenen kolonlar:
+      customer_id, reason1_pred, reason1_prob, true_reason
     """
-    required = ["customer_id","call_prob",
-                "reason1_pred","reason1_prob",
-                "reason2_pred","reason2_prob",
-                "true_reason"]
+    required = ["customer_id", "reason1_pred", "reason1_prob", "true_reason"]
     miss = [c for c in required if c not in df.columns]
     if miss:
         raise ValueError(f"Eksik kolon(lar): {miss}")
 
     data = df.copy()
-    base = data.loc[data["call_prob"] >= base_call_floor].copy()
-    if base.empty:
-        raise ValueError(f"call_prob ≥ {base_call_floor} sonrası satır yok.")
 
+    # Çalışılacak reason listesi
     if reasons is None:
-        reasons = sorted(base["true_reason"].dropna().astype(str).unique().tolist())
+        reasons = sorted(data["true_reason"].dropna().astype(str).unique().tolist())
 
-    grid = np.round(np.arange(0, 1.0 + 1e-9, grid_step), 4)
+    grid = np.round(np.arange(0.0, 1.0 + 1e-9, grid_step), 4)
 
-    def _count(mask, ids, uniq): return int(pd.Series(ids[mask]).nunique()) if uniq else int(mask.sum())
+    def _count(mask, ids, uniq): 
+        return int(pd.Series(ids[mask]).nunique()) if uniq else int(mask.sum())
+
     def _tp(mask, ids, y_true, uniq):
         if uniq:
             d = pd.DataFrame({"id": ids[mask], "y": y_true[mask]})
-            return int(d.groupby("id")["y"].max().sum())
+            if d.empty: return 0
+            return int(d.groupby("id")["y"].max().sum())   # müşteri bazında en az bir doğru
         else:
             return int(y_true[mask].sum())
 
-    results = []
+    rows = []
+    ids_all = data["customer_id"].to_numpy()
+    r1_prob = data["reason1_prob"].to_numpy()
+    # true/1 ve pred eşleşmeleri reason bazında oluşturulacak
 
     for r in reasons:
-        sub = base.copy()
-        y_true = (sub["true_reason"].astype(str) == str(r)).astype(int).to_numpy()
-        ids = sub["customer_id"].to_numpy()
-        r1_pred = (sub["reason1_pred"].astype(str) == str(r)).to_numpy()
-        r2_pred = (sub["reason2_pred"].astype(str) == str(r)).to_numpy()
-        r1_prob = sub["reason1_prob"].to_numpy()
-        r2_prob = sub["reason2_prob"].to_numpy()
+        y_true = (data["true_reason"].astype(str) == str(r)).to_numpy().astype(int)
+        r1_pred_eq = (data["reason1_pred"].astype(str) == str(r)).to_numpy()
 
-        best = dict(precision=-1.0, n=0, tp=0, t1=np.nan, t2=np.nan, fallback=True)
+        best = dict(t=np.nan, n=0, tp=0, prec=-1.0, fallback=True)
 
-        for t1 in grid:
-            for t2 in grid:
-                mask1 = r1_pred & (r1_prob >= t1)
-                mask2 = r2_pred & (r2_prob >= t2)
-                mask = mask1 | mask2  # OR yaklaşımı
-                n = _count(mask, ids, unique_customers)
-                if n == 0:
-                    continue
-                tp = _tp(mask, ids, y_true, unique_customers)
-                prec = tp / n if n else 0.0
-                qualifies = n >= min_count
+        for t in grid:
+            mask = r1_pred_eq & (r1_prob >= t)
+            n  = _count(mask, ids_all, unique_customers)
+            if n == 0:
+                continue
+            tp = _tp(mask, ids_all, y_true, unique_customers)
+            prec = tp / n if n else 0.0
+            qualifies = n >= min_count
 
-                better = False
-                if qualifies and (best["fallback"] or prec > best["precision"]):
+            better = False
+            if qualifies and (best["fallback"] or prec > best["prec"]):
+                better = True
+            elif not qualifies and best["fallback"] and (prec > best["prec"]):
+                better = True
+            elif prec == best["prec"]:
+                if tp > best["tp"]:
                     better = True
-                elif not qualifies and best["fallback"] and (prec > best["precision"]):
+                elif tp == best["tp"] and n < best["n"]:
                     better = True
-                elif prec == best["precision"]:
-                    if tp > best["tp"]: better = True
-                    elif tp == best["tp"] and n < best["n"]: better = True
-                    elif tp == best["tp"] and n == best["n"] and (t1 + t2) > ((best["t1"] or 0) + (best["t2"] or 0)):
-                        better = True
+                elif tp == best["tp"] and n == best["n"] and t > (best["t"] if not np.isnan(best["t"]) else -1):
+                    better = True
 
-                if better:
-                    best.update(dict(precision=prec, n=n, tp=tp,
-                                     t1=t1, t2=t2, fallback=not qualifies))
+            if better:
+                best.update(dict(t=t, n=n, tp=tp, prec=prec, fallback=not qualifies))
 
-        results.append({
+        rows.append({
             "reason": r,
-            "call_prob_floor": base_call_floor,
-            "reason1_best_th": best["t1"],
-            "reason2_best_th": best["t2"],
-            "predicted_count": best["n"],
+            "reason1_best_th": best["t"],
+            "predicted_count": best["n"],       # (tekil müşteri sayısı, unique_customers=True ise)
             "true_positives": best["tp"],
-            "precision": np.round(best["precision"], 6),
-            "fallback": best["fallback"]
+            "precision": np.round(best["prec"], 6) if best["prec"] >= 0 else np.nan,
+            "fallback": best["fallback"]        # min_count sağlanamadıysa True
         })
 
-    return pd.DataFrame(results).sort_values(
-        ["fallback","precision"], ascending=[True,False]
-    ).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(
+        ["fallback", "precision"], ascending=[Tr]()
