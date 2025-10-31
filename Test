@@ -1,67 +1,100 @@
 import pandas as pd
 import numpy as np
-from typing import Optional, List
 
-def _count_unique(mask, ids):
-    return int(pd.Series(ids[mask]).nunique())
+# ---- 0) Hızlı sağlık kontrolü (neden çıktı yok?) -------------------
+def sanity_check_reason12(df, base_call_floor=0.70):
+    req = ["customer_id","call_prob","reason1_pred","reason1_prob","reason2_pred","reason2_prob","true_reason"]
+    miss = [c for c in req if c not in df.columns]
+    print("Eksik kolonlar:", miss if miss else "yok")
 
+    print("Toplam satır:", len(df))
+    print(f"call_prob ≥ {base_call_floor} satır:", (df["call_prob"] >= base_call_floor).sum())
+
+    def uniq_nonnull(s): 
+        return sorted(pd.Series(s).dropna().astype(str).unique().tolist())
+
+    print("unique true_reason:", uniq_nonnull(df["true_reason"]))
+    print("unique reason1_pred:", uniq_nonnull(df["reason1_pred"]))
+    print("unique reason2_pred:", uniq_nonnull(df["reason2_pred"]))
+
+    base = df[df["call_prob"] >= base_call_floor]
+    print("base içinde uniq true_reason:", uniq_nonnull(base["true_reason"]))
+    print("base’de reason1_pred∩true_reason var mı? ->",
+          len(set(uniq_nonnull(base["reason1_pred"])) & set(uniq_nonnull(base["true_reason"])))>0)
+    print("base’de reason2_pred∩true_reason var mı? ->",
+          len(set(uniq_nonnull(base["reason2_pred"])) & set(uniq_nonnull(base["true_reason"])))>0)
+
+# ---- 1) Optimize (log’lu, çıktıyı garanti eden) ---------------------
 def optimize_thresholds_reason12(
     df: pd.DataFrame,
     *,
     min_count: int = 500,
     base_call_floor: float = 0.70,
     grid_step: float = 0.01,
-    reasons: Optional[List[str]] = None
-):
-    """
-    call_prob, reason1_pred/prob, reason2_pred/prob ve true_reason içeren tabloda
-    her arama nedeni için reason1 ve reason2 için en iyi thresholdları bulur.
-    """
-    required = [
-        "customer_id", "call_prob",
-        "reason1_pred", "reason1_prob",
-        "reason2_pred", "reason2_prob",
-        "true_reason"
-    ]
-    miss = [c for c in required if c not in df.columns]
+    reasons: list | None = None,
+    verbose: bool = True
+) -> pd.DataFrame:
+    req = ["customer_id","call_prob","reason1_pred","reason1_prob","reason2_pred","reason2_prob","true_reason"]
+    miss = [c for c in req if c not in df.columns]
     if miss:
         raise ValueError(f"Eksik kolon(lar): {miss}")
 
     data = df.copy()
     base = data.loc[data["call_prob"] >= base_call_floor].copy()
     if base.empty:
-        raise ValueError(f"call_prob ≥ {base_call_floor} sonrası satır yok.")
+        if verbose:
+            print(f"[INFO] call_prob ≥ {base_call_floor} sonrası satır yok.")
+        # boş tablo döndür ama şemayı koru
+        return pd.DataFrame(columns=[
+            "reason","call_prob_floor","reason1_best_th","reason2_best_th",
+            "predicted_count","true_positives","precision","fallback"
+        ])
 
+    # Çalışılacak reason kümesini güvenli al: true_reason ∪ reason1_pred ∪ reason2_pred
     if reasons is None:
-        reasons = sorted(base["true_reason"].dropna().unique().tolist())
+        reasons = sorted(
+            pd.Index(base["true_reason"]).astype(str)
+            .append(pd.Index(base["reason1_pred"]).astype(str))
+            .append(pd.Index(base["reason2_pred"]).astype(str))
+            .dropna().unique().tolist()
+        )
 
-    grid = np.round(np.arange(0, 1.0001, grid_step), 4)
-
+    grid = np.round(np.arange(0.0, 1.0 + 1e-9, grid_step), 4)
     results = []
+
+    # Yardımcılar (tekil müşteri bazlı sayım)
+    def count_unique(mask, ids): return int(pd.Series(ids[mask]).nunique())
+    def tp_unique(mask, ids, y):
+        d = pd.DataFrame({"id": ids[mask], "y": y[mask]})
+        if d.empty: return 0
+        return int(d.groupby("id")["y"].max().sum())
 
     for r in reasons:
         sub = base.copy()
-        y_true = (sub["true_reason"] == r).astype(int).to_numpy()
+        # “bu reason doğru mu?” hedefi
+        y_true = (sub["true_reason"].astype(str) == str(r)).astype(int).to_numpy()
         ids = sub["customer_id"].to_numpy()
-        r1_pred = (sub["reason1_pred"] == r).to_numpy()
-        r2_pred = (sub["reason2_pred"] == r).to_numpy()
+        r1_pred = (sub["reason1_pred"].astype(str) == str(r)).to_numpy()
+        r2_pred = (sub["reason2_pred"].astype(str) == str(r)).to_numpy()
         r1_prob = sub["reason1_prob"].to_numpy()
         r2_prob = sub["reason2_prob"].to_numpy()
 
         best = dict(precision=-1.0, n=0, tp=0, t1=np.nan, t2=np.nan, fallback=True)
+        any_candidate = False
 
+        # reason1 önce; yanlış/altında kalanlara reason2 şansı
         for t1 in grid:
             mask_r1 = r1_pred & (r1_prob >= t1)
-            # reason1 doğru değilse reason2’ye şans ver
-            mask_candidates = ~mask_r1
+            mask_cand = ~mask_r1
             for t2 in grid:
-                mask_r2 = mask_candidates & r2_pred & (r2_prob >= t2)
+                mask_r2 = mask_cand & r2_pred & (r2_prob >= t2)
                 mask = mask_r1 | mask_r2
-                n = _count_unique(mask, ids)
+                n = count_unique(mask, ids)
                 if n == 0:
                     continue
-                tp = int(pd.DataFrame({"id": ids[mask], "y": y_true[mask]}).groupby("id")["y"].max().sum())
-                prec = tp / n if n else 0
+                any_candidate = True
+                tp = tp_unique(mask, ids, y_true)
+                prec = tp / n if n else 0.0
                 qualifies = n >= min_count
 
                 better = False
@@ -70,15 +103,17 @@ def optimize_thresholds_reason12(
                 elif not qualifies and best["fallback"] and (prec > best["precision"]):
                     better = True
                 elif prec == best["precision"]:
-                    if tp > best["tp"]:
-                        better = True
-                    elif tp == best["tp"] and n < best["n"]:
-                        better = True
+                    if tp > best["tp"]: better = True
+                    elif tp == best["tp"] and n < best["n"]: better = True
                     elif tp == best["tp"] and n == best["n"] and (t1 + t2) > ((best["t1"] or 0) + (best["t2"] or 0)):
                         better = True
 
                 if better:
                     best.update(dict(precision=prec, n=n, tp=tp, t1=t1, t2=t2, fallback=not qualifies))
+
+        if verbose:
+            print(f"[{r}] candidates_found={any_candidate}  best_n={best['n']}  best_prec={best['precision']:.6f}  "
+                  f"t1={best['t1']} t2={best['t2']} fallback={best['fallback']}")
 
         results.append({
             "reason": r,
@@ -87,8 +122,24 @@ def optimize_thresholds_reason12(
             "reason2_best_th": best["t2"],
             "predicted_count": best["n"],
             "true_positives": best["tp"],
-            "precision": np.round(best["precision"], 6),
+            "precision": (np.round(best["precision"], 6) if best["precision"] >= 0 else np.nan),
             "fallback": best["fallback"]
         })
 
-    return pd.DataFrame(results).sort_values(["fallback", "precision"], ascending=[True, False]).reset_index(drop=True)
+    out = pd.DataFrame(results).sort_values(["fallback","precision"], ascending=[True,False]).reset_index(drop=True)
+    if verbose:
+        print("\n[SUMMARY]")
+        print(out.head(10))
+    return out
+
+# ---- 2) Örnek çağrı (çıktıyı mutlaka yazdır) ------------------------
+# sanity_check_reason12(df, base_call_floor=0.70)
+# res = optimize_thresholds_reason12(
+#     df,
+#     min_count=500,
+#     base_call_floor=0.70,
+#     grid_step=0.02,   # hız için istersen 0.02 başlayıp sonra 0.01'e in
+#     verbose=True
+# )
+# print("\nFinal sonuç boyutu:", res.shape)
+# display(res.head(20))  # notebook’ta
