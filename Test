@@ -9,8 +9,7 @@ CONFIG = {
 ‘target_sl’: 0.80,  # %80 servis seviyesi
 ‘target_asa’: 30,  # 30 saniye içinde yanıt
 ‘shrinkage’: 0.10,  # %10 mola/eğitim/izin
-‘interval_minutes’: 30,
-‘b_queue_ratio_weekday’: 0.40  # B kuyruğu hafta içi %40 oranı
+‘interval_minutes’: 30
 }
 
 # Vardiya tanımları
@@ -117,34 +116,48 @@ return pd.DataFrame(data)
 def calculate_weekday_staffing(df):
 “””
 Hafta içi agent ihtiyacını hesapla
-Kuyruk mantığı: B agentları B çağrılarının %40’ını karşılar, %60’ı A’ya yardım eder
-“””
-results = []
 
 ```
+Mantık:
+- B kuyruğuna gelen çağrıları SADECE B agentları karşılar
+- A kuyruğuna gelen çağrıları hem A hem B agentları karşılayabilir
+- Toplam A çağrısı için toplam agent (A+B) hesapla
+- B çağrısı için sadece B agent hesapla
+- B agent sayısı >= B için gereken
+- A agent sayısı = Toplam - B agent
+"""
+results = []
+
 for idx, row in df.iterrows():
-    # B kuyruğu: Sadece B çağrılarının %40'ını karşılar
-    b_only_calls = row['queue_b'] * CONFIG['b_queue_ratio_weekday']
-    agents_b_only = calculate_agents(
-        b_only_calls,
+    # B kuyruğu için gereken agent (sadece B agentları karşılar)
+    agents_for_b = calculate_agents(
+        row['queue_b'],
         CONFIG['interval_minutes'],
         CONFIG['aht'],
         CONFIG['target_asa']
     )
     
-    # A kuyruğu + B'nin kalan %60'ı (B agentları A'ya yardım eder)
-    b_helps_a_calls = row['queue_b'] * (1 - CONFIG['b_queue_ratio_weekday'])
-    total_a_calls = row['queue_a'] + b_helps_a_calls
-    agents_a = calculate_agents(
-        total_a_calls,
+    # A kuyruğu için A+B agentları birlikte çalışır
+    # Toplam ihtiyaç = A çağrıları için gereken agent
+    agents_for_a = calculate_agents(
+        row['queue_a'],
         CONFIG['interval_minutes'],
         CONFIG['aht'],
         CONFIG['target_asa']
     )
+    
+    # B agentları hem B hem A'ya bakıyor, A agentları sadece A'ya bakıyor
+    # Toplam agent = A için gereken + B için gereken
+    # Ama B agentları zaten A'ya da yardım ediyor, o yüzden:
+    # - B agent: B çağrıları için minimum gerekli
+    # - A agent: A çağrıları için gereken (B'nin yardımı dahil hesaplanır)
+    
+    agents_b = agents_for_b
+    agents_a = agents_for_a
     
     # Shrinkage ekle (mola, eğitim, izin için %10 ekstra)
     final_agents_a = math.ceil(agents_a / (1 - CONFIG['shrinkage']))
-    final_agents_b = math.ceil(agents_b_only / (1 - CONFIG['shrinkage']))
+    final_agents_b = math.ceil(agents_b / (1 - CONFIG['shrinkage']))
     
     results.append({
         'time': row['time'],
@@ -161,13 +174,18 @@ return pd.DataFrame(results)
 def calculate_weekend_staffing(df):
 “””
 Hafta sonu agent ihtiyacını hesapla
-Kuyruk mantığı: Kuyruklar arası yardım YOK, her kuyruk bağımsız
-“””
-results = []
 
 ```
+Mantık:
+- Kuyruklar arası yardım YOK
+- B kuyruğu = B agentları
+- A kuyruğu = A agentları
+- Her kuyruk bağımsız
+"""
+results = []
+
 for idx, row in df.iterrows():
-    # A kuyruğu
+    # A kuyruğu - sadece A agentları
     agents_a = calculate_agents(
         row['queue_a'],
         CONFIG['interval_minutes'],
@@ -175,7 +193,7 @@ for idx, row in df.iterrows():
         CONFIG['target_asa']
     )
     
-    # B kuyruğu
+    # B kuyruğu - sadece B agentları
     agents_b = calculate_agents(
         row['queue_b'],
         CONFIG['interval_minutes'],
@@ -250,6 +268,49 @@ for shift in SHIFTS:
 return pd.DataFrame(shift_results)
 ```
 
+def calculate_with_custom_data(df_weekday, df_weekend=None):
+“””
+Kendi çağrı verinle hesaplama yap
+
+```
+Parameters:
+-----------
+df_weekday : DataFrame
+    Columns: 'time', 'queue_a', 'queue_b'
+    Hafta içi çağrı tahminleri
+
+df_weekend : DataFrame, optional
+    Columns: 'time', 'queue_a', 'queue_b'
+    Hafta sonu çağrı tahminleri (opsiyonel)
+
+Returns:
+--------
+tuple : (weekday_staffing, weekend_staffing, shift_analysis)
+"""
+
+print("\n📊 Kendi verinle hesaplama yapılıyor...")
+print(f"Hafta içi veri: {len(df_weekday)} satır")
+
+# Hafta içi hesaplama
+weekday_staffing = calculate_weekday_staffing(df_weekday)
+
+# Hafta sonu hesaplama
+if df_weekend is not None:
+    print(f"Hafta sonu veri: {len(df_weekend)} satır")
+    weekend_staffing = calculate_weekend_staffing(df_weekend)
+else:
+    print("Hafta sonu veri yok, hafta içi verinin %60'ı kullanılıyor")
+    df_weekend_generated = df_weekday.copy()
+    df_weekend_generated['queue_a'] = (df_weekend_generated['queue_a'] * 0.6).round()
+    df_weekend_generated['queue_b'] = (df_weekend_generated['queue_b'] * 0.6).round()
+    weekend_staffing = calculate_weekend_staffing(df_weekend_generated)
+
+# Vardiya analizi
+shift_analysis = calculate_shift_requirements(weekday_staffing, weekend_staffing)
+
+return weekday_staffing, weekend_staffing, shift_analysis
+```
+
 def main():
 “”“Ana fonksiyon - tüm hesaplamaları yap ve sonuçları göster”””
 
@@ -262,7 +323,9 @@ print(f"  - AHT: {CONFIG['aht']} saniye")
 print(f"  - Hedef Servis Seviyesi: {CONFIG['target_sl']*100}%")
 print(f"  - Hedef Yanıt Süresi: {CONFIG['target_asa']} saniye")
 print(f"  - Shrinkage: {CONFIG['shrinkage']*100}%")
-print(f"  - B Kuyruk Oranı (Hafta İçi): {CONFIG['b_queue_ratio_weekday']*100}%")
+print(f"\nKuyruk Mantığı:")
+print(f"  - Hafta İçi: B agentları B çağrılarını karşılar + A'ya yardım eder")
+print(f"  - Hafta Sonu: Kuyruklar bağımsız, yardım yok")
 print("\n" + "=" * 80)
 
 # 1. Örnek veri oluştur
@@ -287,14 +350,22 @@ print("\n" + "=" * 80)
 print("📊 HAFTA İÇİ ÖZET")
 print("-" * 80)
 print(f"Toplam Günlük Çağrı: {weekday_staffing['queue_a_calls'].sum() + weekday_staffing['queue_b_calls'].sum()}")
+print(f"  - A Kuyruğu: {weekday_staffing['queue_a_calls'].sum()}")
+print(f"  - B Kuyruğu: {weekday_staffing['queue_b_calls'].sum()}")
 print(f"Peak Agent İhtiyacı: {weekday_staffing['total_agents'].max()}")
+print(f"  - A Agentları: {weekday_staffing['agents_a'].max()}")
+print(f"  - B Agentları: {weekday_staffing['agents_b'].max()}")
 print(f"Ortalama Agent İhtiyacı: {weekday_staffing['total_agents'].mean():.1f}")
 print(f"Peak Saati: {weekday_staffing.loc[weekday_staffing['total_agents'].idxmax(), 'time']}")
 
 print("\n📊 HAFTA SONU ÖZET")
 print("-" * 80)
 print(f"Toplam Günlük Çağrı: {weekend_staffing['queue_a_calls'].sum() + weekend_staffing['queue_b_calls'].sum()}")
+print(f"  - A Kuyruğu: {weekend_staffing['queue_a_calls'].sum()}")
+print(f"  - B Kuyruğu: {weekend_staffing['queue_b_calls'].sum()}")
 print(f"Peak Agent İhtiyacı: {weekend_staffing['total_agents'].max()}")
+print(f"  - A Agentları: {weekend_staffing['agents_a'].max()}")
+print(f"  - B Agentları: {weekend_staffing['agents_b'].max()}")
 print(f"Ortalama Agent İhtiyacı: {weekend_staffing['total_agents'].mean():.1f}")
 print(f"Peak Saati: {weekend_staffing.loc[weekend_staffing['total_agents'].idxmax(), 'time']}")
 
@@ -342,4 +413,20 @@ peak_hours = weekday_df[
     (weekday_df['time'] <= '17:00')
 ]
 print(peak_hours.to_string(index=False))
+
+print("\n\n💡 KENDİ VERİNLE KULLANMAK İÇİN:")
+print("-" * 80)
+print("""
 ```
+
+# CSV’den oku
+
+df_calls = pd.read_csv(‘cagri_tahmin.csv’)
+
+# Gerekli kolonlar: time, queue_a, queue_b
+
+# Hesapla
+
+weekday, weekend, shifts = calculate_with_custom_data(df_calls)
+print(weekday)
+“””)
