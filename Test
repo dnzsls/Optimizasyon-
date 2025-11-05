@@ -1,29 +1,85 @@
-WITH scored AS (
+WITH pct AS (
   SELECT
-    client_no,
-    buy_prob,
-    true_flag_1,
-    -- En yüksek skordan aşağıya kümülatif yüzde
-    CUME_DIST() OVER (ORDER BY buy_prob DESC) AS cume_top
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY buy_prob) AS p95,
+    PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY buy_prob) AS p90,
+    PERCENTILE_CONT(0.85) WITHIN GROUP (ORDER BY buy_prob) AS p85,
+    PERCENTILE_CONT(0.80) WITHIN GROUP (ORDER BY buy_prob) AS p80,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY buy_prob) AS p75,
+    PERCENTILE_CONT(0.70) WITHIN GROUP (ORDER BY buy_prob) AS p70,
+    PERCENTILE_CONT(0.65) WITHIN GROUP (ORDER BY buy_prob) AS p65,
+    PERCENTILE_CONT(0.60) WITHIN GROUP (ORDER BY buy_prob) AS p60,
+    PERCENTILE_CONT(0.55) WITHIN GROUP (ORDER BY buy_prob) AS p55,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY buy_prob) AS p50,
+    PERCENTILE_CONT(0.45) WITHIN GROUP (ORDER BY buy_prob) AS p45,
+    PERCENTILE_CONT(0.40) WITHIN GROUP (ORDER BY buy_prob) AS p40,
+    PERCENTILE_CONT(0.35) WITHIN GROUP (ORDER BY buy_prob) AS p35,
+    PERCENTILE_CONT(0.30) WITHIN GROUP (ORDER BY buy_prob) AS p30,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY buy_prob) AS p25,
+    PERCENTILE_CONT(0.20) WITHIN GROUP (ORDER BY buy_prob) AS p20,
+    PERCENTILE_CONT(0.15) WITHIN GROUP (ORDER BY buy_prob) AS p15,
+    PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY buy_prob) AS p10,
+    PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY buy_prob) AS p05
   FROM your_table
 ),
-binned AS (
+banded AS (
   SELECT
-    client_no,
-    buy_prob,
-    true_flag_1,
-    /* 1..20: 1 = en üst %5, 20 = en alt %5 */
-    CEIL(cume_top * 20) AS bin20
-  FROM scored
+    t.client_no,
+    t.buy_prob,
+    t.true_flag_1,
+    CASE
+      WHEN buy_prob >= p95 THEN '95–100'
+      WHEN buy_prob >= p90 THEN '90–95'
+      WHEN buy_prob >= p85 THEN '85–90'
+      WHEN buy_prob >= p80 THEN '80–85'
+      WHEN buy_prob >= p75 THEN '75–80'
+      WHEN buy_prob >= p70 THEN '70–75'
+      WHEN buy_prob >= p65 THEN '65–70'
+      WHEN buy_prob >= p60 THEN '60–65'
+      WHEN buy_prob >= p55 THEN '55–60'
+      WHEN buy_prob >= p50 THEN '50–55'
+      WHEN buy_prob >= p45 THEN '45–50'
+      WHEN buy_prob >= p40 THEN '40–45'
+      WHEN buy_prob >= p35 THEN '35–40'
+      WHEN buy_prob >= p30 THEN '30–35'
+      WHEN buy_prob >= p25 THEN '25–30'
+      WHEN buy_prob >= p20 THEN '20–25'
+      WHEN buy_prob >= p15 THEN '15–20'
+      WHEN buy_prob >= p10 THEN '10–15'
+      WHEN buy_prob >= p05 THEN '5–10'
+      ELSE '0–5'
+    END AS band
+  FROM your_table t
+  CROSS JOIN pct
 )
 SELECT
-  bin20,
-  -- bin20=1 ~ 95–100, bin20=2 ~ 90–95, ... (tepeden aşağı)
+  band,
   ROUND(MIN(buy_prob), 4) AS min_th,
   ROUND(MAX(buy_prob), 4) AS max_th,
-  COUNT(*)                AS n,
-  SUM(true_flag_1)        AS tp,
+  COUNT(*) AS sample_size,
+  SUM(true_flag_1) AS tp,
   ROUND(SUM(true_flag_1)/COUNT(*), 3) AS precision_rate
-FROM binned
-GROUP BY bin20
-ORDER BY bin20;
+FROM banded
+GROUP BY band
+ORDER BY
+  CASE band
+    WHEN '95–100' THEN 1
+    WHEN '90–95' THEN 2
+    WHEN '85–90' THEN 3
+    WHEN '80–85' THEN 4
+    WHEN '75–80' THEN 5
+    WHEN '70–75' THEN 6
+    WHEN '65–70' THEN 7
+    WHEN '60–65' THEN 8
+    WHEN '55–60' THEN 9
+    WHEN '50–55' THEN 10
+    WHEN '45–50' THEN 11
+    WHEN '40–45' THEN 12
+    WHEN '35–40' THEN 13
+    WHEN '30–35' THEN 14
+    WHEN '25–30' THEN 15
+    WHEN '20–25' THEN 16
+    WHEN '15–20' THEN 17
+    WHEN '10–15' THEN 18
+    WHEN '5–10'  THEN 19
+    ELSE 20
+  END;
