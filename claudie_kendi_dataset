@@ -277,4 +277,58 @@ def main(df_weekday, df_weekend=None):
     print(f"Peak Agent İhtiyacı: {weekday_staffing['total_agents'].max()}")
     print(f"  - A Agentları: {weekday_staffing['agents_a'].max()}")
     print(f"  - B Agentları: {weekday_staffing['agents_b'].max()}")
-    print(f"Ortalama Agent İhtiyacı: {weekday_staffing['total_agents']_]()_
+    print(f"Ortalama Agent İhtiyacı: {weekday_staffing['total_agents'].mean():.1f}")
+    print(f"Peak Saati: {weekday_staffing.loc[weekday_staffing['total_agents'].idxmax(), 'time']}")
+
+    print("\n📊 HAFTA SONU ÖZET")
+    print("-" * 80)
+    print(f"Toplam Günlük Çağrı: {weekend_staffing['queue_a_calls'].sum() + weekend_staffing['queue_b_calls'].sum()}")
+    print(f"  - A Kuyruğu: {weekend_staffing['queue_a_calls'].sum()}")
+    print(f"  - B Kuyruğu: {weekend_staffing['queue_b_calls'].sum()}")
+    print(f"Peak Agent İhtiyacı: {weekend_staffing['total_agents'].max()}")
+    print(f"  - A Agentları: {weekend_staffing['agents_a'].max()}")
+    print(f"  - B Agentları: {weekend_staffing['agents_b'].max()}")
+    print(f"Ortalama Agent İhtiyacı: {weekend_staffing['total_agents'].mean():.1f}")
+    print(f"Peak Saati: {weekend_staffing.loc[weekend_staffing['total_agents'].idxmax(), 'time']}")
+
+    print("\n" + "=" * 80)
+    print("\n📋 HAFTA İÇİ DETAYLI AGENT İHTİYACI (İlk 20 satır)")
+    print("-" * 80)
+    print(weekday_staffing.head(20).to_string(index=False))
+
+    print("\n\n📋 HAFTA SONU DETAYLI AGENT İHTİYACI (İlk 20 satır)")
+    print("-" * 80)
+    print(weekend_staffing.head(20).to_string(index=False))
+
+    print("\n\n📅 VARDİYA BAZLI AGENT İHTİYACI")
+    print("-" * 80)
+    print(shift_analysis.to_string(index=False))
+
+    print("\n" + "=" * 80)
+
+    # Excel'e kaydet
+    try:
+        with pd.ExcelWriter('call_center_staffing_plan.xlsx', engine='openpyxl') as writer:
+            weekday_staffing.to_excel(writer, sheet_name='Hafta_Ici', index=False)
+            weekend_staffing.to_excel(writer, sheet_name='Hafta_Sonu', index=False)
+            shift_analysis.to_excel(writer, sheet_name='Vardiya_Plani', index=False)
+        print("\n✅ Sonuçlar 'call_center_staffing_plan.xlsx' dosyasına kaydedildi!")
+    except Exception as e:
+        print(f"\n⚠️  Excel kaydetme hatası: {e}")
+        print("Not: openpyxl kurulu değilse: pip install openpyxl")
+
+    return weekday_staffing, weekend_staffing, shift_analysis
+
+
+# ÇALIŞTIRMA ÖRNEĞİ
+if __name__ == "__main__":
+    # Örnek: kendi haftaiçi df'in
+    # df_weekday = dfim_haftaici  # time, queue_a, queue_b
+    # df_weekend = dfim_haftasonu  # varsa; yoksa None bırak
+
+    # Buraya kendi değişkenini koyacaksın:
+    # Örneğin sadece haftaiçi verin varsa:
+    # df_weekend = None
+    # weekday_df, weekend_df, shifts_df = main(df_weekday, df_weekend)
+
+    print("Bu script'i doğrudan çalıştırmak için df_weekday ve df_weekend değişkenlerini tanımla.")
