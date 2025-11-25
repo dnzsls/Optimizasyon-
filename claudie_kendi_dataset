@@ -1,0 +1,280 @@
+import pandas as pd
+import numpy as np
+import math
+
+# Konfigürasyon
+CONFIG = {
+    'aht': 188,          # saniye
+    'target_sl': 0.80,   # %80 servis seviyesi
+    'target_asa': 30,    # 30 saniye içinde yanıt
+    'shrinkage': 0.10,   # %10 mola/eğitim/izin
+    'interval_minutes': 30
+}
+
+# Vardiya tanımları
+SHIFTS = [
+    {'name': 'V1', 'start': '07:00', 'end': '16:00', 'duration': 9},
+    {'name': 'V2', 'start': '08:00', 'end': '17:00', 'duration': 9},
+    {'name': 'V3', 'start': '09:00', 'end': '18:00', 'duration': 9},
+    {'name': 'V4', 'start': '10:00', 'end': '19:00', 'duration': 9},
+    {'name': 'V5', 'start': '15:00', 'end': '24:00', 'duration': 9},
+    {'name': 'V6', 'start': '17:00', 'end': '01:00', 'duration': 8, 'overnight': True},
+    {'name': 'V7', 'start': '18:00', 'end': '02:00', 'duration': 8, 'overnight': True},
+    {'name': 'V8', 'start': '19:00', 'end': '03:00', 'duration': 8, 'overnight': True},
+    {'name': 'V9', 'start': '00:00', 'end': '08:00', 'duration': 8},
+    {'name': 'V10', 'start': '08:00', 'end': '17:30', 'duration': 9.5},
+    {'name': 'V11', 'start': '09:00', 'end': '18:30', 'duration': 9.5},
+    {'name': 'V12', 'start': '10:00', 'end': '19:30', 'duration': 9.5},
+    {'name': 'V13', 'start': '11:00', 'end': '20:30', 'duration': 9.5},
+    {'name': 'V14', 'start': '12:00', 'end': '21:30', 'duration': 9.5},
+    {'name': 'V15', 'start': '13:00', 'end': '22:30', 'duration': 9.5},
+    {'name': 'V16', 'start': '14:00', 'end': '23:30', 'duration': 9.5},
+    {'name': 'V17', 'start': '15:00', 'end': '00:30', 'duration': 9.5, 'overnight': True},
+    {'name': 'V18', 'start': '17:00', 'end': '01:30', 'duration': 8.5, 'overnight': True},
+    {'name': 'V19', 'start': '18:00', 'end': '02:30', 'duration': 8.5, 'overnight': True}
+]
+
+
+def erlang_c(agents, traffic):
+    """Erlang C formülü ile kuyruk olasılığı (bekleme olasılığı) hesapla."""
+    if agents <= traffic or agents == 0:
+        return 1.0
+
+    # Erlang B hesapla
+    erlang_b = traffic / agents
+    for i in range(2, int(agents) + 1):
+        erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
+
+    # Erlang C hesapla
+    erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
+    return min(erlang_c_val, 1.0)
+
+
+def calculate_agents(calls, interval_min, aht, target_asa):
+    """Belirli bir çağrı hacmi için, hedef ASA'yı sağlayacak minimum agent sayısını bul."""
+    if calls == 0:
+        return 0
+
+    # Traffic hesapla (Erlang birimiyle)
+    traffic = (calls * (aht / 60)) / interval_min  # AHT'yi dakikaya çevirip kullanıyor
+
+    if traffic == 0:
+        return 0
+
+    # Agent sayısını aradığımız aralık
+    min_agents = math.ceil(traffic)
+    max_agents = math.ceil(traffic * 3) + 5
+
+    # Basit bir lineer arama (binary search yerine), min'den max'e doğru
+    for agents in range(min_agents, max_agents + 1):
+        ec = erlang_c(agents, traffic)
+
+        # ASA hesapla (saniye)
+        if agents > traffic:
+            asa = (ec * (aht / 60)) / (agents - traffic) * 60
+        else:
+            asa = 999  # yetersiz agent => çok yüksek ASA
+
+        if asa <= target_asa:
+            return agents
+
+    return max_agents
+
+
+def calculate_weekday_staffing(df):
+    """
+    Hafta içi agent ihtiyacını hesaplar.
+
+    Mantık:
+    - B kuyruğuna gelen çağrıları SADECE B agentları karşılar.
+    - A kuyruğuna gelen çağrıları hem A hem B agentları karşılayabilir.
+    - Biz basitleştirilmiş olarak:
+      * B için gereken agent sayısını ayrı
+      * A için gereken agent sayısını ayrı hesaplıyoruz.
+    """
+    results = []
+
+    for idx, row in df.iterrows():
+        agents_for_b = calculate_agents(
+            row['queue_b'],
+            CONFIG['interval_minutes'],
+            CONFIG['aht'],
+            CONFIG['target_asa']
+        )
+
+        agents_for_a = calculate_agents(
+            row['queue_a'],
+            CONFIG['interval_minutes'],
+            CONFIG['aht'],
+            CONFIG['target_asa']
+        )
+
+        agents_b = agents_for_b
+        agents_a = agents_for_a
+
+        # Shrinkage ekle
+        final_agents_a = math.ceil(agents_a / (1 - CONFIG['shrinkage']))
+        final_agents_b = math.ceil(agents_b / (1 - CONFIG['shrinkage']))
+
+        results.append({
+            'time': row['time'],
+            'queue_a_calls': row['queue_a'],
+            'queue_b_calls': row['queue_b'],
+            'agents_a': final_agents_a,
+            'agents_b': final_agents_b,
+            'total_agents': final_agents_a + final_agents_b
+        })
+
+    return pd.DataFrame(results)
+
+
+def calculate_weekend_staffing(df):
+    """
+    Hafta sonu agent ihtiyacını hesaplar.
+
+    Mantık:
+    - Kuyruklar arası yardım yok.
+    - A kuyruğu sadece A agentları,
+    - B kuyruğu sadece B agentları.
+    """
+    results = []
+
+    for idx, row in df.iterrows():
+        agents_a = calculate_agents(
+            row['queue_a'],
+            CONFIG['interval_minutes'],
+            CONFIG['aht'],
+            CONFIG['target_asa']
+        )
+
+        agents_b = calculate_agents(
+            row['queue_b'],
+            CONFIG['interval_minutes'],
+            CONFIG['aht'],
+            CONFIG['target_asa']
+        )
+
+        final_agents_a = math.ceil(agents_a / (1 - CONFIG['shrinkage']))
+        final_agents_b = math.ceil(agents_b / (1 - CONFIG['shrinkage']))
+
+        results.append({
+            'time': row['time'],
+            'queue_a_calls': row['queue_a'],
+            'queue_b_calls': row['queue_b'],
+            'agents_a': final_agents_a,
+            'agents_b': final_agents_b,
+            'total_agents': final_agents_a + final_agents_b
+        })
+
+    return pd.DataFrame(results)
+
+
+def is_time_in_shift(time_str, shift):
+    """Verilen 'HH:MM' zamanının, ilgili vardiyanın içinde olup olmadığını kontrol eder."""
+    h, m = map(int, time_str.split(':'))
+    time_minutes = h * 60 + m
+
+    start_h, start_m = map(int, shift['start'].split(':'))
+    start_minutes = start_h * 60 + start_m
+
+    end_h, end_m = map(int, shift['end'].split(':'))
+    end_minutes = end_h * 60 + end_m
+
+    # Gece vardiyaları için
+    if shift.get('overnight', False) and end_minutes <= start_minutes:
+        end_minutes += 24 * 60
+        if time_minutes < start_minutes:
+            time_minutes += 24 * 60
+
+    return start_minutes <= time_minutes < end_minutes
+
+
+def calculate_shift_requirements(weekday_df, weekend_df):
+    """
+    Vardiya bazlı agent ihtiyacını hesaplar.
+    Her vardiya için, o vardiyanın kapsadığı zaman dilimlerindeki maksimum
+    toplam agent ihtiyacını alır.
+    """
+    shift_results = []
+
+    for shift in SHIFTS:
+        weekday_intervals = weekday_df[
+            weekday_df['time'].apply(lambda x: is_time_in_shift(x, shift))
+        ]
+        weekday_max = weekday_intervals['total_agents'].max() if len(weekday_intervals) > 0 else 0
+
+        weekend_intervals = weekend_df[
+            weekend_df['time'].apply(lambda x: is_time_in_shift(x, shift))
+        ]
+        weekend_max = weekend_intervals['total_agents'].max() if len(weekend_intervals) > 0 else 0
+
+        shift_results.append({
+            'shift_name': shift['name'],
+            'start_time': shift['start'],
+            'end_time': shift['end'],
+            'duration_hours': shift['duration'],
+            'weekday_agents_needed': int(weekday_max),
+            'weekend_agents_needed': int(weekend_max)
+        })
+
+    return pd.DataFrame(shift_results)
+
+
+def calculate_with_custom_data(df_weekday, df_weekend=None):
+    """
+    Kendi çağrı verinle hesaplama yap.
+
+    df_weekday: time, queue_a, queue_b
+    df_weekend: time, queue_a, queue_b (opsiyonel)
+    """
+    print("\n📊 Kendi verinle hesaplama yapılıyor...")
+    print(f"Hafta içi veri: {len(df_weekday)} satır")
+
+    weekday_staffing = calculate_weekday_staffing(df_weekday)
+
+    if df_weekend is not None:
+        print(f"Hafta sonu veri: {len(df_weekend)} satır")
+        weekend_staffing = calculate_weekend_staffing(df_weekend)
+    else:
+        print("Hafta sonu veri yok, hafta içi verinin %60'ı kullanılıyor")
+        df_weekend_generated = df_weekday.copy()
+        df_weekend_generated['queue_a'] = (df_weekend_generated['queue_a'] * 0.6).round()
+        df_weekend_generated['queue_b'] = (df_weekend_generated['queue_b'] * 0.6).round()
+        weekend_staffing = calculate_weekend_staffing(df_weekend_generated)
+
+    shift_analysis = calculate_shift_requirements(weekday_staffing, weekend_staffing)
+
+    return weekday_staffing, weekend_staffing, shift_analysis
+
+
+def main(df_weekday, df_weekend=None):
+    """Ana fonksiyon - dışarıdan verilen df'lerle tüm hesaplamayı yapar."""
+    print("=" * 80)
+    print("ÇAĞRI MERKEZİ KAPASİTE PLANLAMA ANALİZİ")
+    print("=" * 80)
+    print(f"\nKonfigürasyon:")
+    print(f"  - AHT: {CONFIG['aht']} saniye")
+    print(f"  - Hedef Servis Seviyesi: {CONFIG['target_sl']*100}%")
+    print(f"  - Hedef Yanıt Süresi: {CONFIG['target_asa']} saniye")
+    print(f"  - Shrinkage: {CONFIG['shrinkage']*100}%")
+    print(f"\nKuyruk Mantığı:")
+    print(f"  - Hafta İçi: B agentları B çağrılarını karşılar + A'ya yardım eder")
+    print(f"  - Hafta Sonu: Kuyruklar bağımsız, yardım yok")
+    print("\n" + "=" * 80)
+
+    print("[1/3] Hafta içi / hafta sonu agent ihtiyacı hesaplanıyor...")
+    weekday_staffing, weekend_staffing, shift_analysis = calculate_with_custom_data(
+        df_weekday, df_weekend
+    )
+
+    # Özet istatistikler
+    print("\n" + "=" * 80)
+    print("📊 HAFTA İÇİ ÖZET")
+    print("-" * 80)
+    print(f"Toplam Günlük Çağrı: {weekday_staffing['queue_a_calls'].sum() + weekday_staffing['queue_b_calls'].sum()}")
+    print(f"  - A Kuyruğu: {weekday_staffing['queue_a_calls'].sum()}")
+    print(f"  - B Kuyruğu: {weekday_staffing['queue_b_calls'].sum()}")
+    print(f"Peak Agent İhtiyacı: {weekday_staffing['total_agents'].max()}")
+    print(f"  - A Agentları: {weekday_staffing['agents_a'].max()}")
+    print(f"  - B Agentları: {weekday_staffing['agents_b'].max()}")
+    print(f"Ortalama Agent İhtiyacı: {weekday_staffing['total_agents']_]()_
