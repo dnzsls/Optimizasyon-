@@ -1,56 +1,76 @@
 """
-FONKSİYON 1: Traffic Hesaplama
-En temel fonksiyon - Traffic nedir öğrenelim
+FONKSİYON 2: Erlang C
+Çağrının kuyrukta bekleme olasılığını hesaplar
 """
 
-def calculate_traffic(calls, interval_min, aht):
+def erlang_c(agents, traffic):
     """
-    Traffic (Erlang): Çağrı yoğunluğunu hesaplar
+    Erlang C: Çağrıların kuyrukta bekleyeceği olasılığı hesaplar
     
-    Formül:
-    Traffic = (Çağrı_Sayısı × AHT_dakika) / İnterval_dakika
+    Parametreler:
+    - agents: Kaç agent var?
+    - traffic: Kaç Erlang? (Fonksiyon 1'den gelir)
     
-    Ne demek?
-    - Traffic = Sürekli kaç agent meşgul kalır?
+    Dönüş:
+    - 0-1 arası olasılık
+    - 0.3 = %30 çağrı bekler
+    - 0.8 = %80 çağrı bekler
     """
-    traffic = (calls * (aht / 60)) / interval_min
-    return traffic
+    if agents <= traffic or agents == 0:
+        return 1.0  # Yetersiz agent = herkes bekler (%100)
+    
+    # Matematiksel formül (Erlang B üzerinden)
+    erlang_b = traffic / agents
+    for i in range(2, int(agents) + 1):
+        erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
+    
+    erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
+    return min(erlang_c_val, 1.0)
 
 
 # TEST EDELİM
 if __name__ == '__main__':
     print("=" * 60)
-    print("FONKSİYON 1: TRAFFIC HESAPLAMA")
+    print("FONKSİYON 2: ERLANG C")
     print("=" * 60)
     
-    # Örnek 1: Az yoğun
-    calls1 = 20
-    traffic1 = calculate_traffic(calls1, interval_min=30, aht=180)
-    print(f"\nÖrnek 1: Az Yoğun")
-    print(f"  Çağrı: {calls1} adet")
-    print(f"  Interval: 30 dakika")
-    print(f"  AHT: 180 saniye (3 dakika)")
-    print(f"  Traffic: {traffic1:.2f} Erlang")
-    print(f"  Yorum: {traffic1:.0f} agent sürekli meşgul kalır")
+    # 5 Erlang traffic var (50 çağrı, 180sn AHT, 30dk interval)
+    traffic = 5.0
     
-    # Örnek 2: Orta yoğun
-    calls2 = 50
-    traffic2 = calculate_traffic(calls2, interval_min=30, aht=180)
-    print(f"\nÖrnek 2: Orta Yoğun")
-    print(f"  Çağrı: {calls2} adet")
-    print(f"  Traffic: {traffic2:.2f} Erlang")
-    print(f"  Yorum: {traffic2:.0f} agent sürekli meşgul kalır")
+    print(f"\nSabit: Traffic = {traffic} Erlang")
+    print(f"Soru: Farklı agent sayılarıyla bekleme olasılığı ne?\n")
     
-    # Örnek 3: Çok yoğun
-    calls3 = 100
-    traffic3 = calculate_traffic(calls3, interval_min=30, aht=180)
-    print(f"\nÖrnek 3: Çok Yoğun")
-    print(f"  Çağrı: {calls3} adet")
-    print(f"  Traffic: {traffic3:.2f} Erlang")
-    print(f"  Yorum: {traffic3:.0f} agent sürekli meşgul kalır")
+    # Test 1: Yetersiz agent
+    agents1 = 5
+    prob1 = erlang_c(agents1, traffic)
+    print(f"Test 1: {agents1} agent")
+    print(f"  Bekleme olasılığı: {prob1:.2%}")
+    print(f"  Yorum: Agent = Traffic, hemen hemen herkes bekler! ❌")
+    
+    # Test 2: Biraz fazla agent
+    agents2 = 7
+    prob2 = erlang_c(agents2, traffic)
+    print(f"\nTest 2: {agents2} agent")
+    print(f"  Bekleme olasılığı: {prob2:.2%}")
+    print(f"  Yorum: {agents2-traffic:.0f} fazla agent var, daha iyi ✓")
+    
+    # Test 3: Çok fazla agent
+    agents3 = 10
+    prob3 = erlang_c(agents3, traffic)
+    print(f"\nTest 3: {agents3} agent")
+    print(f"  Bekleme olasılığı: {prob3:.2%}")
+    print(f"  Yorum: {agents3-traffic:.0f} fazla agent, çok az bekleme ✅")
+    
+    # Test 4: Aşırı fazla agent
+    agents4 = 15
+    prob4 = erlang_c(agents4, traffic)
+    print(f"\nTest 4: {agents4} agent")
+    print(f"  Bekleme olasılığı: {prob4:.2%}")
+    print(f"  Yorum: {agents4-traffic:.0f} fazla agent, neredeyse hiç bekleme 🎯")
     
     print("\n" + "=" * 60)
-    print("💡 ÖNEMLI:")
-    print("  Traffic = Minimum gereken agent sayısı")
-    print("  Ama hedef ASA için daha fazla agent gerek!")
+    print("💡 ÖĞRENME:")
+    print("  - Agent = Traffic → Kötü (%100 bekleme)")
+    print("  - Agent > Traffic → İyi (bekleme azalır)")
+    print("  - Agent çok fazla → Gereksiz (boşa agent)")
     print("=" * 60)
