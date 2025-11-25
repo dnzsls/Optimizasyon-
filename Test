@@ -1,25 +1,13 @@
 """
-FONKSİYON 2: Erlang C
-Çağrının kuyrukta bekleme olasılığını hesaplar
+FONKSİYON 3: ASA (Average Speed to Answer)
+Ortalama kaç saniyede yanıt verileceğini hesaplar
 """
 
 def erlang_c(agents, traffic):
-    """
-    Erlang C: Çağrıların kuyrukta bekleyeceği olasılığı hesaplar
-    
-    Parametreler:
-    - agents: Kaç agent var?
-    - traffic: Kaç Erlang? (Fonksiyon 1'den gelir)
-    
-    Dönüş:
-    - 0-1 arası olasılık
-    - 0.3 = %30 çağrı bekler
-    - 0.8 = %80 çağrı bekler
-    """
+    """Önceki fonksiyon - bekleme olasılığı"""
     if agents <= traffic or agents == 0:
-        return 1.0  # Yetersiz agent = herkes bekler (%100)
+        return 1.0
     
-    # Matematiksel formül (Erlang B üzerinden)
     erlang_b = traffic / agents
     for i in range(2, int(agents) + 1):
         erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
@@ -28,49 +16,85 @@ def erlang_c(agents, traffic):
     return min(erlang_c_val, 1.0)
 
 
+def calculate_asa(agents, traffic, aht):
+    """
+    ASA: Ortalama kaç saniyede yanıt veriliyor?
+    
+    Formül mantığı:
+    ASA = (Bekleme_Olasılığı × AHT) / (Fazla_Agent) × 60
+    
+    Parametreler:
+    - agents: Agent sayısı
+    - traffic: Trafik (Erlang)
+    - aht: Average Handle Time (saniye)
+    
+    Dönüş:
+    - ASA (saniye)
+    """
+    if agents <= traffic:
+        return 999  # Yetersiz agent = çok uzun bekleme
+    
+    # Bekleme olasılığı (Fonksiyon 2)
+    ec = erlang_c(agents, traffic)
+    
+    # ASA hesapla
+    # (ec × AHT_dakika) / (fazla_agent) × 60
+    asa = (ec * (aht / 60)) / (agents - traffic) * 60
+    
+    return asa
+
+
 # TEST EDELİM
 if __name__ == '__main__':
     print("=" * 60)
-    print("FONKSİYON 2: ERLANG C")
+    print("FONKSİYON 3: ASA HESAPLAMA")
     print("=" * 60)
     
-    # 5 Erlang traffic var (50 çağrı, 180sn AHT, 30dk interval)
-    traffic = 5.0
+    # Sabit değerler
+    traffic = 5.0  # 5 Erlang
+    aht = 180      # 180 saniye (3 dakika)
     
-    print(f"\nSabit: Traffic = {traffic} Erlang")
-    print(f"Soru: Farklı agent sayılarıyla bekleme olasılığı ne?\n")
+    print(f"\nSabit:")
+    print(f"  Traffic: {traffic} Erlang")
+    print(f"  AHT: {aht} saniye")
+    print(f"\nSoru: Farklı agent sayılarıyla ASA ne?\n")
     
-    # Test 1: Yetersiz agent
-    agents1 = 5
-    prob1 = erlang_c(agents1, traffic)
+    # Test 1: 6 agent
+    agents1 = 6
+    asa1 = calculate_asa(agents1, traffic, aht)
     print(f"Test 1: {agents1} agent")
-    print(f"  Bekleme olasılığı: {prob1:.2%}")
-    print(f"  Yorum: Agent = Traffic, hemen hemen herkes bekler! ❌")
+    print(f"  Fazla agent: {agents1 - traffic}")
+    print(f"  ASA: {asa1:.1f} saniye")
+    print(f"  Yorum: Çok uzun! ❌")
     
-    # Test 2: Biraz fazla agent
+    # Test 2: 7 agent
     agents2 = 7
-    prob2 = erlang_c(agents2, traffic)
+    asa2 = calculate_asa(agents2, traffic, aht)
     print(f"\nTest 2: {agents2} agent")
-    print(f"  Bekleme olasılığı: {prob2:.2%}")
-    print(f"  Yorum: {agents2-traffic:.0f} fazla agent var, daha iyi ✓")
+    print(f"  Fazla agent: {agents2 - traffic}")
+    print(f"  ASA: {asa2:.1f} saniye")
+    print(f"  Yorum: Hala uzun")
     
-    # Test 3: Çok fazla agent
-    agents3 = 10
-    prob3 = erlang_c(agents3, traffic)
+    # Test 3: 8 agent
+    agents3 = 8
+    asa3 = calculate_asa(agents3, traffic, aht)
     print(f"\nTest 3: {agents3} agent")
-    print(f"  Bekleme olasılığı: {prob3:.2%}")
-    print(f"  Yorum: {agents3-traffic:.0f} fazla agent, çok az bekleme ✅")
+    print(f"  Fazla agent: {agents3 - traffic}")
+    print(f"  ASA: {asa3:.1f} saniye")
+    print(f"  Yorum: 30 sn hedefine yaklaştı ✓")
     
-    # Test 4: Aşırı fazla agent
-    agents4 = 15
-    prob4 = erlang_c(agents4, traffic)
+    # Test 4: 10 agent
+    agents4 = 10
+    asa4 = calculate_asa(agents4, traffic, aht)
     print(f"\nTest 4: {agents4} agent")
-    print(f"  Bekleme olasılığı: {prob4:.2%}")
-    print(f"  Yorum: {agents4-traffic:.0f} fazla agent, neredeyse hiç bekleme 🎯")
+    print(f"  Fazla agent: {agents4 - traffic}")
+    print(f"  ASA: {asa4:.1f} saniye")
+    print(f"  Yorum: Çok iyi! Hedef 30 sn altında 🎯")
     
     print("\n" + "=" * 60)
     print("💡 ÖĞRENME:")
-    print("  - Agent = Traffic → Kötü (%100 bekleme)")
-    print("  - Agent > Traffic → İyi (bekleme azalır)")
-    print("  - Agent çok fazla → Gereksiz (boşa agent)")
+    print("  - Fazla agent az → ASA yüksek (uzun bekleme)")
+    print("  - Fazla agent çok → ASA düşük (kısa bekleme)")
+    print("  - Hedef: 30 saniye ASA için kaç agent gerek?")
     print("=" * 60)
+    print("\n➡️ Sonraki fonksiyon: Hedef ASA için agent sayısı bulma")
