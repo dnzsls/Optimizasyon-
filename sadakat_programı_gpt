@@ -1,0 +1,508 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from typing import Dict, Tuple, Any, List
+
+
+# ---------------------------------------------------------
+# 0. Yardımcı fonksiyon: zaman ağırlıkları ekle
+# ---------------------------------------------------------
+
+def add_time_weights(df: pd.DataFrame, decay: float = 0.9) -> pd.DataFrame:
+    """
+    data_date üzerinden months_ago ve time_weight hesaplar.
+    """
+    df = df.copy()
+    df["data_date"] = pd.to_datetime(df["data_date"])
+    max_date = df["data_date"].max()
+
+    months_ago = ((max_date.year - df["data_date"].dt.year) * 12 +
+                  (max_date.month - df["data_date"].dt.month))
+
+    df["months_ago"] = months_ago
+    df["time_weight"] = decay ** df["months_ago"]
+
+    return df
+
+
+# ---------------------------------------------------------
+# 1. Müşteri + görev bazlı recency-weighted empirik dağılım
+# ---------------------------------------------------------
+
+def build_recency_weighted_empirical_per_customer_task(
+    df: pd.DataFrame,
+    decay: float = 0.9
+) -> Dict[Tuple[Any, Any], Dict[str, np.ndarray]]:
+    """
+    Her (musteri_id, gorev_id) için:
+      - recency-weighted empirik dağılım (values, probs)
+    döndürür.
+
+    Çıktı yapısı:
+      {
+        (musteri_id, gorev_id): {
+            "values": np.array([...]),
+            "probs": np.array([...])
+        },
+        ...
+      }
+    """
+    df_w = add_time_weights(df, decay=decay)
+
+    dists: Dict[Tuple[Any, Any], Dict[str, np.ndarray]] = {}
+
+    for (m_id, g_id), group in df_w.groupby(["musteri_id", "gorev_id"]):
+        # Aynı count değerlerine göre ağırlıkları topla
+        tmp = (group
+               .groupby("gorev_orjinal_count")["time_weight"]
+               .sum()
+               .reset_index())
+
+        # Eğer hiç gözlem yoksa atla
+        if tmp.empty:
+            continue
+
+        values = tmp["gorev_orjinal_count"].to_numpy()
+        weights = tmp["time_weight"].to_numpy()
+        probs = weights / weights.sum()
+
+        dists[(m_id, g_id)] = {
+            "values": values,
+            "probs": probs
+        }
+
+    return dists
+
+
+# ---------------------------------------------------------
+# 2. Görev bazlı global recency-weighted empirik dağılım
+# ---------------------------------------------------------
+
+def build_global_recency_weighted_empirical_per_task(
+    df: pd.DataFrame,
+    decay: float = 0.9
+) -> Dict[Any, Dict[str, np.ndarray]]:
+    """
+    Her gorev_id için tüm müşterileri birleştirerek
+    recency-weighted empirik dağılım üretir.
+
+    Çıktı:
+      {
+        gorev_id: {
+            "values": np.array([...]),
+            "probs": np.array([...])
+        },
+        ...
+      }
+    """
+    df_w = add_time_weights(df, decay=decay)
+
+    dists: Dict[Any, Dict[str, np.ndarray]] = {}
+
+    for g_id, group in df_w.groupby("gorev_id"):
+        tmp = (group
+               .groupby("gorev_orjinal_count")["time_weight"]
+               .sum()
+               .reset_index())
+
+        if tmp.empty:
+            continue
+
+        values = tmp["gorev_orjinal_count"].to_numpy()
+        weights = tmp["time_weight"].to_numpy()
+        probs = weights / weights.sum()
+
+        dists[g_id] = {
+            "values": values,
+            "probs": probs
+        }
+
+    return dists
+
+
+# ---------------------------------------------------------
+# 3. Threshold sınıflandırma yardımcıları
+# ---------------------------------------------------------
+
+def classify_threshold(
+    total_points: pd.Series,
+    thresholds: Dict[str, Dict[str, float]]
+) -> pd.Series:
+    """
+    Yıllık toplam puana göre T3/T2/T1/T0 etiketlerini döndürür.
+
+    thresholds:
+      {"T1": {"value": 1000, "reward": 10}, ...}
+    """
+    # Value'lara göre sıralayıp en yüksekten aşağı kontrol edeceğiz
+    # Varsayılan isimler T1, T2, T3 ama yine de value'ya göre sort edelim.
+    th_list = sorted(
+        [(name, cfg["value"]) for name, cfg in thresholds.items()],
+        key=lambda x: x[1]
+    )
+    # Örn: [("T1", 1000), ("T2", 2500), ("T3", 4000)]
+    # Biz en yüksekten aşağı kontrol etmek istiyoruz
+    th_list = th_list[::-1]
+
+    conditions = []
+    choices = []
+    for name, value in th_list:
+        conditions.append(total_points >= value)
+        choices.append(name)
+
+    labels = np.select(conditions, choices, default="T0")
+    return pd.Series(labels, index=total_points.index, name="gecilen_threshold")
+
+
+# ---------------------------------------------------------
+# 4. Yıllık simülasyon fonksiyonu
+# ---------------------------------------------------------
+
+def simulate_year(
+    df_history: pd.DataFrame,
+    tasks_config: Dict[Any, Dict[str, Any]],
+    thresholds: Dict[str, Dict[str, float]],
+    year: int,
+    initial_customers: int = 1_000_000,
+    final_customers: int = 1_500_000,
+    decay: float = 0.9,
+    random_state: int = 42
+):
+    """
+    - Geçmiş veriden recency-weighted dağılımlar kurar.
+    - Belirtilen yıl için 12 ay simülasyon yapar.
+    - Ocak'ta initial_customers, Aralık'ta final_customers müşteri olacak
+      şekilde lineer artış kullanır (müşteri sayısı düşmez).
+    - Mevcut müşteriler: df_history'deki musteri_id'ler.
+    - Yeni gelen müşteriler: yeni id'ler üretilir ve global dağılımlara göre
+      simüle edilir.
+
+    Çıktılar:
+      df_monthly_tasks: (year, month, musteri_id, gorev_id, sim_count, effective_count, kazanilan_puan)
+      df_yearly_customers: (year, musteri_id, yillik_toplam_puan, gecilen_threshold)
+      df_monthly_summary: (year, month, toplam_musteri_sayisi, T1_..., T2_..., T3_..., T1_odul_tutari, ..., toplam_odul_tutari)
+    """
+
+    rng = np.random.default_rng(random_state)
+
+    # 1) Dağılımları hazırla
+    cust_task_dists = build_recency_weighted_empirical_per_customer_task(
+        df_history,
+        decay=decay
+    )
+    global_task_dists = build_global_recency_weighted_empirical_per_task(
+        df_history,
+        decay=decay
+    )
+
+    # 2) Mevcut müşteriler
+    existing_customers = np.sort(df_history["musteri_id"].unique())
+    n_existing = len(existing_customers)
+
+    # initial / final müşteri sayısının mevcut müşterilerden az olmamasını garanti et
+    if initial_customers < n_existing:
+        initial_customers = n_existing
+    if final_customers < initial_customers:
+        final_customers = initial_customers
+
+    # 3) Aylık müşteri sayıları (lineer artış)
+    monthly_customer_counts = np.linspace(
+        initial_customers,
+        final_customers,
+        num=12
+    ).astype(int)
+
+    # 4) Ay sonu tarihleri
+    month_ends = pd.date_range(start=f"{year}-01-01", periods=12, freq="M")
+
+    # 5) Müşteri seti ve id üretimi
+    active_customers = list(existing_customers)
+    if len(active_customers) == 0:
+        # hiç müşteri yoksa 1'den başlat
+        next_new_id = 1
+    else:
+        next_new_id = int(max(active_customers)) + 1
+
+    # 6) Yıl içinde müşterilerin kümülatif puanları
+    cum_points: Dict[Any, float] = {m_id: 0.0 for m_id in active_customers}
+
+    monthly_rows = []      # detay: müşteri+görev bazlı aylık puan
+    monthly_summary_rows = []  # özet: ay bazlı threshold ve ödül
+    # Her ay sonunda aylık müşteri toplam puanına da erişmek istersen
+    # ayrıca bir df daha türetebilirsin (aşağıda kolay).
+
+    # 7) Threshold değerlerini kolay erişmek için hazırlayalım
+    th_values = {name: cfg["value"] for name, cfg in thresholds.items()}
+    th_rewards = {name: cfg["reward"] for name, cfg in thresholds.items()}
+
+    # 8) Simülasyon döngüsü
+    for month_idx in range(12):
+        target_n_customers = monthly_customer_counts[month_idx]
+        month_end = month_ends[month_idx]
+        month_num = month_idx + 1
+
+        # Gerekirse yeni müşteri ekle
+        current_n = len(active_customers)
+        if target_n_customers > current_n:
+            n_new = target_n_customers - current_n
+            new_ids = list(range(next_new_id, next_new_id + n_new))
+            next_new_id += n_new
+            active_customers.extend(new_ids)
+            # Yeni müşterilerin kümülatif puanlarını 0'dan başlat
+            for m_id in new_ids:
+                cum_points[m_id] = 0.0
+        else:
+            # Daha az müşteri istemiyoruz, aktif müşteri seti büyüyerek devam etsin
+            target_n_customers = current_n
+            monthly_customer_counts[month_idx] = current_n
+
+        # Bu ay için DataFrame benzeri kayıtları toplayacağız
+        month_task_rows = []
+
+        # Her müşteri, her görev için simülasyon
+        for m_id in active_customers:
+            for g_id, cfg in tasks_config.items():
+                # Görev bu ayda aktif mi?
+                task_start = pd.to_datetime(cfg["start_date"])
+                if task_start > month_end:
+                    continue  # henüz başlamamış
+
+                # Bu müşteri+görev için hangi dağılımı kullanacağız?
+                dist_key = (m_id, g_id)
+                if dist_key in cust_task_dists:
+                    dist = cust_task_dists[dist_key]
+                else:
+                    # Müşteri bu görev için geçmişe sahip değil, global dağılıma bak
+                    if g_id in global_task_dists:
+                        dist = global_task_dists[g_id]
+                    else:
+                        # Bu görev için hiç global history yoksa, count = 0 varsay
+                        sim_count = 0
+                        effective_count = 0
+                        kazanilan_puan = 0.0
+                        month_task_rows.append({
+                            "year": year,
+                            "month": month_num,
+                            "musteri_id": m_id,
+                            "gorev_id": g_id,
+                            "sim_gorev_orjinal_count": sim_count,
+                            "effective_count": effective_count,
+                            "kazanilan_puan": kazanilan_puan
+                        })
+                        # kümülatif puana ekleyecek bir şey yok
+                        continue
+
+                values = dist["values"]
+                probs = dist["probs"]
+                # Dağılımdan bir count çek
+                sim_count = rng.choice(values, p=probs)
+
+                task_point = cfg["task_point"]
+                max_count = cfg["max_count"]
+
+                effective_count = min(sim_count, max_count)
+                kazanilan_puan = effective_count * task_point
+
+                # Kayıt ekle
+                month_task_rows.append({
+                    "year": year,
+                    "month": month_num,
+                    "musteri_id": m_id,
+                    "gorev_id": g_id,
+                    "sim_gorev_orjinal_count": sim_count,
+                    "effective_count": effective_count,
+                    "kazanilan_puan": kazanilan_puan
+                })
+
+                # Kümülatif puana ekle
+                cum_points[m_id] += kazanilan_puan
+
+        # Bu ayın tüm müşteri+görev kayıtlarını büyük listeye ekle
+        monthly_rows.extend(month_task_rows)
+
+        # Ay sonu threshold ve ödül özetini hesapla (YTD puan üzerinden)
+        s_cum = pd.Series(cum_points)
+
+        # T1/T2/T3 üstündeki müşteri sayıları
+        T1_name = "T1"
+        T2_name = "T2"
+        T3_name = "T3"
+
+        T1_cnt = int((s_cum >= th_values[T1_name]).sum())
+        T2_cnt = int((s_cum >= th_values[T2_name]).sum())
+        T3_cnt = int((s_cum >= th_values[T3_name]).sum())
+
+        T1_reward_total = T1_cnt * th_rewards[T1_name]
+        T2_reward_total = T2_cnt * th_rewards[T2_name]
+        T3_reward_total = T3_cnt * th_rewards[T3_name]
+        total_reward = T1_reward_total + T2_reward_total + T3_reward_total
+
+        monthly_summary_rows.append({
+            "year": year,
+            "month": month_num,
+            "toplam_musteri_sayisi": len(active_customers),
+            "T1_ustunde_musteri_sayisi": T1_cnt,
+            "T2_ustunde_musteri_sayisi": T2_cnt,
+            "T3_ustunde_musteri_sayisi": T3_cnt,
+            "T1_odul_tutari": T1_reward_total,
+            "T2_odul_tutari": T2_reward_total,
+            "T3_odul_tutari": T3_reward_total,
+            "toplam_odul_tutari": total_reward
+        })
+
+    # 9) DataFrame'lere dönüştür
+    df_monthly_tasks = pd.DataFrame(monthly_rows)
+
+    # Müşteri bazlı yıllık toplam puan
+    s_yillik = pd.Series(cum_points, name="yillik_toplam_puan")
+    df_yearly_customers = s_yillik.reset_index().rename(columns={"index": "musteri_id"})
+    df_yearly_customers.insert(0, "year", year)
+
+    # Threshold label'ını ekle
+    df_yearly_customers["gecilen_threshold"] = classify_threshold(
+        df_yearly_customers["yillik_toplam_puan"],
+        thresholds
+    )
+
+    df_monthly_summary = pd.DataFrame(monthly_summary_rows)
+
+    return df_monthly_tasks, df_yearly_customers, df_monthly_summary
+
+
+# ---------------------------------------------------------
+# 5. Özet ve grafik fonksiyonları
+# ---------------------------------------------------------
+
+def summarize_yearly_results(df_yearly_customers: pd.DataFrame, thresholds: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+    """
+    Yearly müşteri bazlı df'den threshold dağılımını ve oranları çıkarır.
+    """
+    total_customers = len(df_yearly_customers)
+    summary_rows = []
+
+    # T0, T1, T2, T3 sayıları
+    for label in ["T0", "T1", "T2", "T3"]:
+        cnt = int((df_yearly_customers["gecilen_threshold"] == label).sum())
+        ratio = cnt / total_customers if total_customers > 0 else 0.0
+        summary_rows.append({
+            "threshold_label": label,
+            "musteri_sayisi": cnt,
+            "oran": ratio
+        })
+
+    return pd.DataFrame(summary_rows)
+
+
+def plot_results(df_monthly_summary: pd.DataFrame):
+    """
+    Basit bazı grafikler:
+      - Aylık toplam müşteri sayısı
+      - Aylık toplam ödül tutarı
+      - Aylık T1/T2/T3 üstünde müşteri sayısı
+    """
+    # Aylık toplam müşteri sayısı
+    plt.figure()
+    plt.plot(df_monthly_summary["month"], df_monthly_summary["toplam_musteri_sayisi"], marker="o")
+    plt.xlabel("Ay")
+    plt.ylabel("Toplam Müşteri Sayısı")
+    plt.title("Aylık Toplam Müşteri Sayısı")
+    plt.grid(True)
+    plt.show()
+
+    # Aylık toplam ödül tutarı
+    plt.figure()
+    plt.plot(df_monthly_summary["month"], df_monthly_summary["toplam_odul_tutari"], marker="o")
+    plt.xlabel("Ay")
+    plt.ylabel("Toplam Ödül Tutarı")
+    plt.title("Aylık Toplam Ödül Tutarı")
+    plt.grid(True)
+    plt.show()
+
+    # Aylık T1/T2/T3 sayıları
+    plt.figure()
+    plt.plot(df_monthly_summary["month"], df_monthly_summary["T1_ustunde_musteri_sayisi"], marker="o", label="T1 üzeri")
+    plt.plot(df_monthly_summary["month"], df_monthly_summary["T2_ustunde_musteri_sayisi"], marker="o", label="T2 üzeri")
+    plt.plot(df_monthly_summary["month"], df_monthly_summary["T3_ustunde_musteri_sayisi"], marker="o", label="T3 üzeri")
+    plt.xlabel("Ay")
+    plt.ylabel("Müşteri Sayısı")
+    plt.title("Aylık Threshold Üzerindeki Müşteri Sayıları (YTD)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+# ---------------------------------------------------------
+# 6. Basit grid search iskeleti (opsiyonel, ikinci adım)
+# ---------------------------------------------------------
+
+def simple_grid_search_on_task_points(
+    df_history: pd.DataFrame,
+    base_tasks_config: Dict[Any, Dict[str, Any]],
+    thresholds: Dict[str, Dict[str, float]],
+    year: int,
+    target_ratios: Dict[str, float],
+    task_ids_to_tune: List[Any],
+    multipliers: List[float],
+    decay: float = 0.9,
+    random_state: int = 42
+) -> pd.DataFrame:
+    """
+    Çok basit bir grid search:
+      - Belirli görevler için task_point değerini çarpmak üzere
+        bazı çarpanlar (multipliers) dener.
+      - Her kombinasyon için simülasyon çalıştırır (küçük müşteri sayısı ile
+        deneme yapmak daha mantıklı olabilir).
+      - Yıl sonu T1/T2/T3 oranlarını hesaplar ve target_ratios ile
+        ne kadar yakın olduğunu raporlar.
+
+    target_ratios örn:
+      {"T1": 0.70, "T2": 0.40, "T3": 0.05}
+    """
+
+    results = []
+
+    # Orijinal config'in kopyasını bozmayalım
+    import copy
+
+    for mult in multipliers:
+        # Yeni config: sadece belirtilen görevlerin task_point'lerini çarp
+        tasks_config = copy.deepcopy(base_tasks_config)
+        for g_id in task_ids_to_tune:
+            if g_id in tasks_config:
+                tasks_config[g_id]["task_point"] = tasks_config[g_id]["task_point"] * mult
+
+        # Örneğin grid search aşamasında daha küçük sayılar kullanabilirsin:
+        df_monthly_tasks, df_yearly_customers, df_monthly_summary = simulate_year(
+            df_history=df_history,
+            tasks_config=tasks_config,
+            thresholds=thresholds,
+            year=year,
+            initial_customers=50_000,   # deneme amaçlı küçük ölçekte
+            final_customers=100_000,
+            decay=decay,
+            random_state=random_state
+        )
+
+        df_th_summary = summarize_yearly_results(df_yearly_customers, thresholds)
+
+        # T1/T2/T3 oranlarını al
+        ratio_T1 = float(df_th_summary.loc[df_th_summary["threshold_label"] == "T1", "oran"].values[0])
+        ratio_T2 = float(df_th_summary.loc[df_th_summary["threshold_label"] == "T2", "oran"].values[0])
+        ratio_T3 = float(df_th_summary.loc[df_th_summary["threshold_label"] == "T3", "oran"].values[0])
+
+        # Hedeflerden sapmayı ölçmek için basit bir metrik (MSE gibi)
+        err_T1 = (ratio_T1 - target_ratios.get("T1", 0)) ** 2
+        err_T2 = (ratio_T2 - target_ratios.get("T2", 0)) ** 2
+        err_T3 = (ratio_T3 - target_ratios.get("T3", 0)) ** 2
+        total_error = err_T1 + err_T2 + err_T3
+
+        results.append({
+            "multiplier": mult,
+            "ratio_T1": ratio_T1,
+            "ratio_T2": ratio_T2,
+            "ratio_T3": ratio_T3,
+            "total_error": total_error
+        })
+
+    df_results = pd.DataFrame(results).sort_values("total_error").reset_index(drop=True)
+    return df_results
