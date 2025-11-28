@@ -1,10 +1,20 @@
-# Config'deki max_count değerleri
-print("Config'deki ayarlar:")
-toplam_maks_aylik = 0
-for gorev_id, cfg in tasks_config.items():
-    aylik_maks = cfg['max_count'] * cfg['task_point']
-    toplam_maks_aylik += aylik_maks
-    print(f"  Görev {gorev_id}: {cfg['max_count']} x {cfg['task_point']} = {aylik_maks} puan/ay")
+# Örnek bir müşterinin dağılımına bak
+ornek_key = list(customer_task_dists.keys())[0]
+musteri_id, gorev_id = ornek_key
 
-print(f"\nToplam maksimum aylık puan: {toplam_maks_aylik}")
-print(f"Toplam maksimum yıllık puan: {toplam_maks_aylik * 12}")
+print(f"Müşteri: {musteri_id}, Görev: {gorev_id}")
+print(f"Values: {customer_task_dists[ornek_key]['values']}")
+print(f"Probs: {customer_task_dists[ornek_key]['probs']}")
+print(f"Config max_count: {tasks_config[gorev_id]['max_count']}")
+
+# Ortalama beklenen count
+ortalama = np.sum(customer_task_dists[ornek_key]['values'] * customer_task_dists[ornek_key]['probs'])
+print(f"Beklenen ortalama count: {ortalama:.2f}")
+
+
+
+# Geçmiş veride yıllık puan ortalaması
+gecmis_yillik = df.groupby('musteri_id')['kazanilan_puan'].sum()
+print(f"Geçmiş yıllık puan - Ortalama: {gecmis_yillik.mean():,.0f}")
+print(f"Geçmiş yıllık puan - Medyan: {gecmis_yillik.median():,.0f}")
+print(f"Geçmiş yıllık puan - Max: {gecmis_yillik.max():,.0f}")
