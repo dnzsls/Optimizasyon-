@@ -1,75 +1,173 @@
-def build_recency_weighted_empirical_per_customer_task(df, decay=0.9):
-    """Her (musteri_id, gorev_id) çifti için recency-weighted dağılım oluşturur."""
+def simulate_year(df, tasks_config, thresholds, customer_task_dists, global_task_dists,
+                  start_customers, end_customers, simulation_year, decay=0.9, random_seed=None):
+    """Bir yıllık simülasyon yapar."""
     
-    print("Müşteri-görev dağılımları oluşturuluyor...")
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    
     start_time = time.time()
     
-    df = df.copy()
-    df['data_date'] = pd.to_datetime(df['data_date'])
-    max_date = df['data_date'].max()
+    # Mevcut müşteri ID'leri
+    existing_customers = set(df['musteri_id'].unique())
+    print(f"Mevcut müşteri sayısı: {len(existing_customers):,}")
     
-    # Vektörel hesaplama (apply yerine)
-    df['months_ago'] = (max_date.year - df['data_date'].dt.year) * 12 + (max_date.month - df['data_date'].dt.month)
-    df['time_weight'] = decay ** df['months_ago']
+    # Aylık müşteri sayıları
+    monthly_counts = generate_monthly_customer_counts(start_customers, end_customers)
     
-    print(f"  Ağırlıklar hesaplandı: {time.time() - start_time:.1f} saniye")
+    # Tüm görev ID'leri
+    all_task_ids = list(tasks_config.keys())
     
-    # Grupla ve topla
-    grouped = df.groupby(['musteri_id', 'gorev_id', 'gorev_orjinal_count'])['time_weight'].sum().reset_index()
+    # Yeni müşteri ID sayacı
+    max_existing_id = max(existing_customers) if existing_customers else 0
+    new_customer_id_counter = max_existing_id + 1
     
-    print(f"  Gruplama tamamlandı: {time.time() - start_time:.1f} saniye")
+    # Aktif müşteriler
+    active_customers = set()
+    new_customer_mapping = {}
     
-    # Dictionary oluştur
-    recency_dists = {}
+    # Sonuçlar
+    monthly_results = []
     
-    grouped_by_cust_task = grouped.groupby(['musteri_id', 'gorev_id'])
-    total_groups = len(grouped_by_cust_task)
+    print(f"\nSimülasyon başlıyor (Yıl: {simulation_year})...")
     
-    for idx, ((musteri_id, gorev_id), group) in enumerate(grouped_by_cust_task):
-        values = group['gorev_orjinal_count'].values.astype(float)
-        weights = group['time_weight'].values
-        probs = weights / weights.sum()
+    for month_idx in range(12):
+        month_start = time.time()
+        month_num = month_idx + 1
+        month_end_date = datetime(simulation_year, month_num, 1) + relativedelta(months=1, days=-1)
+        target_customer_count = monthly_counts[month_idx]
         
-        recency_dists[(musteri_id, gorev_id)] = {
-            "values": values,
-            "probs": probs
-        }
+        current_count = len(active_customers)
+        new_customers_needed = target_customer_count - current_count
         
-        if (idx + 1) % 100000 == 0:
-            print(f"  {idx + 1:,} / {total_groups:,} tamamlandı")
-    
-    print(f"Toplam {len(recency_dists):,} dağılım oluşturuldu. Süre: {time.time() - start_time:.1f} saniye")
-    return recency_dists
-
-
-def build_global_recency_weighted_empirical_per_task(df, decay=0.9):
-    """Her gorev_id için global recency-weighted dağılım oluşturur."""
-    
-    print("Global görev dağılımları oluşturuluyor...")
-    start_time = time.time()
-    
-    df = df.copy()
-    df['data_date'] = pd.to_datetime(df['data_date'])
-    max_date = df['data_date'].max()
-    
-    # Vektörel hesaplama
-    df['months_ago'] = (max_date.year - df['data_date'].dt.year) * 12 + (max_date.month - df['data_date'].dt.month)
-    df['time_weight'] = decay ** df['months_ago']
-    
-    # Grupla ve topla
-    grouped = df.groupby(['gorev_id', 'gorev_orjinal_count'])['time_weight'].sum().reset_index()
-    
-    global_dists = {}
-    
-    for gorev_id, group in grouped.groupby('gorev_id'):
-        values = group['gorev_orjinal_count'].values.astype(float)
-        weights = group['time_weight'].values
-        probs = weights / weights.sum()
+        # Müşteri ekleme
+        if month_idx == 0:
+            if len(existing_customers) >= target_customer_count:
+                active_customers = set(np.random.choice(
+                    list(existing_customers), 
+                    size=target_customer_count, 
+                    replace=False
+                ))
+            else:
+                active_customers = existing_customers.copy()
+                new_needed = target_customer_count - len(active_customers)
+                for _ in range(new_needed):
+                    new_customer_mapping[new_customer_id_counter] = month_num
+                    active_customers.add(new_customer_id_counter)
+                    new_customer_id_counter += 1
+        else:
+            for _ in range(max(0, new_customers_needed)):
+                new_customer_mapping[new_customer_id_counter] = month_num
+                active_customers.add(new_customer_id_counter)
+                new_customer_id_counter += 1
         
-        global_dists[gorev_id] = {
-            "values": values,
-            "probs": probs
-        }
+        # Her müşteri için simülasyon
+        month_data = []
+        
+        for customer_id in active_customers:
+            customer_monthly_points = 0
+            
+            for task_id in all_task_ids:
+                task_cfg = tasks_config[task_id]
+                task_start = pd.to_datetime(task_cfg["start_date"])
+                
+                if month_end_date < task_start:
+                    continue
+                
+                task_point = task_cfg["task_point"]
+                max_count = task_cfg["max_count"]
+                
+                # Count çek
+                if customer_id in existing_customers and (customer_id, task_id) in customer_task_dists:
+                    dist = customer_task_dists[(customer_id, task_id)]
+                    count = np.random.choice(dist["values"], p=dist["probs"])
+                else:
+                    if task_id in global_task_dists:
+                        dist = global_task_dists[task_id]
+                        count = np.random.choice(dist["values"], p=dist["probs"])
+                    else:
+                        count = 0
+                
+                effective_count = min(int(count), max_count)
+                earned_points = effective_count * task_point
+                customer_monthly_points += earned_points
+            
+            month_data.append({
+                'musteri_id': customer_id,
+                'ay': month_num,
+                'aylik_puan': customer_monthly_points,
+                'is_new_customer': customer_id in new_customer_mapping
+            })
+        
+        monthly_results.extend(month_data)
+        
+        month_duration = time.time() - month_start
+        print(f"  Ay {month_num} tamamlandı - {len(active_customers):,} müşteri - {month_duration:.1f} saniye")
     
-    print(f"Toplam {len(global_dists)} görev dağılımı oluşturuldu. Süre: {time.time() - start_time:.1f} saniye")
-    return global_dists
+    # DataFrame'e çevir
+    monthly_df = pd.DataFrame(monthly_results)
+    
+    # Yıllık toplamlar
+    print("\nYıllık sonuçlar hesaplanıyor...")
+    yearly_results = monthly_df.groupby('musteri_id').agg({
+        'aylik_puan': 'sum',
+        'is_new_customer': 'first'
+    }).reset_index()
+    yearly_results.columns = ['musteri_id', 'yillik_toplam_puan', 'is_new_customer']
+    yearly_results['yil'] = simulation_year
+    
+    # Threshold belirleme
+    def determine_threshold(points):
+        if points >= thresholds["T3"]["value"]:
+            return "T3"
+        elif points >= thresholds["T2"]["value"]:
+            return "T2"
+        elif points >= thresholds["T1"]["value"]:
+            return "T1"
+        else:
+            return "T0"
+    
+    yearly_results['gecilen_threshold'] = yearly_results['yillik_toplam_puan'].apply(determine_threshold)
+    
+    # Aylık özet
+    monthly_df_sorted = monthly_df.sort_values(['musteri_id', 'ay'])
+    monthly_df_sorted['kumulatif_puan'] = monthly_df_sorted.groupby('musteri_id')['aylik_puan'].cumsum()
+    
+    summary_data = []
+    for month in range(1, 13):
+        month_end_data = monthly_df_sorted[monthly_df_sorted['ay'] == month]
+        
+        if len(month_end_data) == 0:
+            continue
+        
+        total_customers = len(month_end_data)
+        
+        t1_count = (month_end_data['kumulatif_puan'] >= thresholds["T1"]["value"]).sum()
+        t2_count = (month_end_data['kumulatif_puan'] >= thresholds["T2"]["value"]).sum()
+        t3_count = (month_end_data['kumulatif_puan'] >= thresholds["T3"]["value"]).sum()
+        
+        t1_reward = t1_count * thresholds["T1"]["reward"]
+        t2_reward = t2_count * thresholds["T2"]["reward"]
+        t3_reward = t3_count * thresholds["T3"]["reward"]
+        
+        summary_data.append({
+            'yil': simulation_year,
+            'ay': month,
+            'toplam_musteri_sayisi': total_customers,
+            'T1_ustunde_musteri_sayisi': int(t1_count),
+            'T2_ustunde_musteri_sayisi': int(t2_count),
+            'T3_ustunde_musteri_sayisi': int(t3_count),
+            'T1_odul_tutari': int(t1_reward),
+            'T2_odul_tutari': int(t2_reward),
+            'T3_odul_tutari': int(t3_reward),
+            'toplam_odul_tutari': int(t1_reward + t2_reward + t3_reward),
+            'T1_oran': t1_count / total_customers if total_customers > 0 else 0,
+            'T2_oran': t2_count / total_customers if total_customers > 0 else 0,
+            'T3_oran': t3_count / total_customers if total_customers > 0 else 0,
+        })
+    
+    monthly_summary = pd.DataFrame(summary_data)
+    
+    total_duration = time.time() - start_time
+    print(f"\nSimülasyon tamamlandı! Toplam süre: {total_duration/60:.1f} dakika")
+    
+    return yearly_results, monthly_summary
