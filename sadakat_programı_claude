@@ -1,6 +1,10 @@
-# Geçmiş verideki ortalama count
-print("Görev bazlı ortalama count:")
-print(df.groupby('gorev_id')['gorev_orjinal_count'].mean())
+# Config'deki max_count değerleri
+print("Config'deki ayarlar:")
+toplam_maks_aylik = 0
+for gorev_id, cfg in tasks_config.items():
+    aylik_maks = cfg['max_count'] * cfg['task_point']
+    toplam_maks_aylik += aylik_maks
+    print(f"  Görev {gorev_id}: {cfg['max_count']} x {cfg['task_point']} = {aylik_maks} puan/ay")
 
-print("\nGörev bazlı max count:")
-print(df.groupby('gorev_id')['gorev_orjinal_count'].max())
+print(f"\nToplam maksimum aylık puan: {toplam_maks_aylik}")
+print(f"Toplam maksimum yıllık puan: {toplam_maks_aylik * 12}")
