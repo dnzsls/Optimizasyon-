@@ -1,6 +1,6 @@
 """
-FONKSİYON 7: Tüm Gün için Hesaplama (DataFrame)
-Kendi DataFrame'inle çalış - 48 interval birden!
+ADIM 2: B Agentları A'ya Yardım Eder
+Hafta içi mantığı - B agentları hem A hem B çağrılarını karşılar
 """
 import pandas as pd
 import math
@@ -36,102 +36,131 @@ def find_agents_for_target(calls, interval_min, aht, target_asa):
     return max_agents
 
 
-def calculate_full_day(df, interval_min=30, aht=180, target_asa=30, shrinkage=0.10):
+def calculate_with_support(calls_a, calls_b, interval_min=30, aht=180, 
+                           target_asa=30, shrinkage=0.10):
     """
-    Tüm gün için agent hesapla
+    B agentları A'ya yardım eder
     
-    DataFrame formatı:
-    - time: '00:00', '00:30', '01:00', ...
-    - queue_a: A kuyruğu çağrı sayısı
-    - queue_b: B kuyruğu çağrı sayısı
+    Mantık:
+    1. B kuyruğu için B agentları hesapla
+    2. Toplam çağrı (A+B) için gereken B agentı hesapla
+    3. Eğer toplam için gereken ≤ B için gereken:
+       → B agentları hepsini karşılar, A agentı gerekmez
+    4. Değilse:
+       → B agentları B'yi karşılar, A için ekstra A agentı gerek
     
-    BAĞIMSIZ yaklaşım (yardımlaşma yok)
+    B agentları:
+    - B çağrılarını karşılar (öncelik)
+    - Boş kalırsa A'ya yardım eder
     
-    Dönüş:
-    - Yeni DataFrame (time, calls, agents, traffic)
+    A agentları:
+    - Sadece A çağrılarını karşılar
     """
-    results = []
     
-    for idx, row in df.iterrows():
-        time = row['time']
-        calls_a = row['queue_a']
-        calls_b = row['queue_b']
-        
-        # A kuyruğu
-        traffic_a = (calls_a * (aht/60)) / interval_min if calls_a > 0 else 0
-        agents_a_raw = find_agents_for_target(calls_a, interval_min, aht, target_asa)
-        agents_a_final = math.ceil(agents_a_raw / (1 - shrinkage))
-        
-        # B kuyruğu
-        traffic_b = (calls_b * (aht/60)) / interval_min if calls_b > 0 else 0
-        agents_b_raw = find_agents_for_target(calls_b, interval_min, aht, target_asa)
-        agents_b_final = math.ceil(agents_b_raw / (1 - shrinkage))
-        
-        results.append({
-            'time': time,
-            'calls_a': calls_a,
-            'calls_b': calls_b,
-            'traffic_a': round(traffic_a, 2),
-            'traffic_b': round(traffic_b, 2),
-            'agents_a': agents_a_final,
-            'agents_b': agents_b_final,
-            'total_agents': agents_a_final + agents_b_final
-        })
+    # 1. B kuyruğu için gereken B agentları
+    traffic_b = (calls_b * (aht/60)) / interval_min if calls_b > 0 else 0
+    agents_for_b = find_agents_for_target(calls_b, interval_min, aht, target_asa)
     
-    return pd.DataFrame(results)
+    # 2. Toplam çağrı (A+B) için gereken agent
+    total_calls = calls_a + calls_b
+    traffic_total = (total_calls * (aht/60)) / interval_min if total_calls > 0 else 0
+    agents_for_total = find_agents_for_target(total_calls, interval_min, aht, target_asa)
+    
+    # 3. Karar: B agentları yeterli mi?
+    if agents_for_total <= agents_for_b:
+        # B agentları hem A hem B'yi karşılar
+        agents_b_needed = agents_for_total
+        agents_a_needed = 0
+    else:
+        # B agentları B'yi karşılar, A için ekstra gerek
+        agents_b_needed = agents_for_b
+        agents_a_needed = find_agents_for_target(calls_a, interval_min, aht, target_asa)
+    
+    # Shrinkage ekle
+    final_a = math.ceil(agents_a_needed / (1 - shrinkage))
+    final_b = math.ceil(agents_b_needed / (1 - shrinkage))
+    
+    return {
+        'calls_a': calls_a,
+        'calls_b': calls_b,
+        'traffic_b': round(traffic_b, 2),
+        'traffic_total': round(traffic_total, 2),
+        'agents_a': final_a,
+        'agents_b': final_b,
+        'total_agents': final_a + final_b,
+        'b_helps_a': agents_a_needed == 0  # B yardım etti mi?
+    }
 
 
-# TEST EDELİM - KENDİ VERİNLE ÇALIŞIR!
+# TEST: BAĞIMSIZ vs YARDIMLAŞMALI KARŞILAŞTIRMA
 if __name__ == '__main__':
     print("=" * 60)
-    print("FONKSİYON 7: TÜM GÜN HESAPLAMA")
+    print("ADIM 2: B AGENTLARI A'YA YARDIM EDER")
     print("=" * 60)
     
-    # Örnek veri oluştur (senin verin böyle olacak)
-    sample_data = pd.DataFrame({
-        'time': ['00:00', '00:30', '01:00', '01:30', '08:00', '08:30', 
-                 '09:00', '09:30', '17:00', '17:30', '23:00', '23:30'],
-        'queue_a': [5, 5, 5, 5, 30, 40, 50, 55, 35, 30, 10, 8],
-        'queue_b': [3, 3, 3, 3, 15, 20, 30, 35, 20, 15, 5, 4]
-    })
+    # Test senaryosu
+    calls_a = 50
+    calls_b = 30
     
-    print("\n📋 Örnek Veri (ilk 6 satır):")
-    print(sample_data.head(6))
+    print(f"\n📋 Senaryo:")
+    print(f"  A Çağrı: {calls_a}")
+    print(f"  B Çağrı: {calls_b}")
+    print(f"  Toplam: {calls_a + calls_b}\n")
     
-    # Hesapla
-    print("\n⚙️ Hesaplama yapılıyor...")
-    result = calculate_full_day(sample_data)
+    # YÖNTEM 1: Bağımsız (ADIM 1)
+    print("=" * 60)
+    print("YÖNTEM 1: BAĞIMSIZ (Yardımlaşma Yok)")
+    print("=" * 60)
     
-    # Sonuçları göster
+    traffic_a = (calls_a * 3) / 30
+    traffic_b = (calls_b * 3) / 30
+    agents_a_ind = find_agents_for_target(calls_a, 30, 180, 30)
+    agents_b_ind = find_agents_for_target(calls_b, 30, 180, 30)
+    agents_a_final_ind = math.ceil(agents_a_ind / 0.9)
+    agents_b_final_ind = math.ceil(agents_b_ind / 0.9)
+    total_ind = agents_a_final_ind + agents_b_final_ind
+    
+    print(f"A: {calls_a} çağrı (Traffic: {traffic_a:.1f}) → {agents_a_final_ind} agent")
+    print(f"B: {calls_b} çağrı (Traffic: {traffic_b:.1f}) → {agents_b_final_ind} agent")
+    print(f"TOPLAM: {total_ind} agent")
+    
+    # YÖNTEM 2: Yardımlaşmalı (ADIM 2)
     print("\n" + "=" * 60)
-    print("📊 SONUÇLAR")
+    print("YÖNTEM 2: YARDIMLAŞMALI (B Agentları A'ya Yardım)")
     print("=" * 60)
-    print("\nTüm sonuçlar:")
-    print(result.to_string(index=False))
     
-    # Özet istatistikler
+    result = calculate_with_support(calls_a, calls_b)
+    
+    print(f"A: {result['calls_a']} çağrı → {result['agents_a']} agent")
+    print(f"B: {result['calls_b']} çağrı → {result['agents_b']} agent")
+    print(f"TOPLAM: {result['total_agents']} agent")
+    print(f"B yardım etti mi? {'✅ Evet' if result['b_helps_a'] else '❌ Hayır'}")
+    
+    # Karşılaştırma
     print("\n" + "=" * 60)
-    print("📈 ÖZET")
+    print("💰 TASARRUF ANALİZİ")
     print("=" * 60)
-    print(f"Toplam Çağrı A: {result['calls_a'].sum()}")
-    print(f"Toplam Çağrı B: {result['calls_b'].sum()}")
-    print(f"Peak Saat: {result.loc[result['total_agents'].idxmax(), 'time']}")
-    print(f"Peak Agent: {result['total_agents'].max()}")
-    print(f"Ortalama Agent: {result['total_agents'].mean():.1f}")
     
-    # Peak saat detayı
-    peak_idx = result['total_agents'].idxmax()
-    peak_row = result.iloc[peak_idx]
+    saving = total_ind - result['total_agents']
+    saving_pct = (saving / total_ind * 100) if total_ind > 0 else 0
     
-    print(f"\n🔍 Peak Saat Detayı ({peak_row['time']}):")
-    print(f"  A: {peak_row['calls_a']} çağrı → {peak_row['agents_a']} agent")
-    print(f"  B: {peak_row['calls_b']} çağrı → {peak_row['agents_b']} agent")
-    print(f"  Toplam: {peak_row['total_agents']} agent")
+    print(f"Bağımsız: {total_ind} agent")
+    print(f"Yardımlaşmalı: {result['total_agents']} agent")
+    print(f"Tasarruf: {saving} agent ({saving_pct:.1f}%)")
+    
+    if saving > 0:
+        print(f"\n✅ {saving} agent daha az gerekiyor!")
+    else:
+        print(f"\n⚠️ Bu senaryoda fark yok")
     
     print("\n" + "=" * 60)
-    print("✅ BU FONKSİYON KENDİ VERİNLE ÇALIŞIR!")
+    print("💡 MANTIK:")
     print("=" * 60)
-    print("\nKullanım:")
-    print("  df = pd.read_excel('cagrilar.xlsx')")
-    print("  result = calculate_full_day(df)")
-    print("  result.to_excel('agent_ihtiyaci.xlsx')")
+    print("Bağımsız:")
+    print("  A agentları: Sadece A")
+    print("  B agentları: Sadece B")
+    print("  → Her kuyruk kendi başına\n")
+    print("Yardımlaşmalı:")
+    print("  A agentları: Sadece A")
+    print("  B agentları: B + boşsa A'ya yardım")
+    print("  → B agentları çift görev!")
