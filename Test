@@ -1,9 +1,11 @@
 """
-ADIM 2: B Agentları A'ya Yardım Eder
-Hafta içi mantığı - B agentları hem A hem B çağrılarını karşılar
+Interval Bazlı Agent Hesaplama - Yardımlaşmalı
+B agentları B çağrılarını karşılar, boş kalırsa A'ya yardım eder
 """
 import pandas as pd
 import math
+
+# ============= TEMEL FONKSİYONLAR =============
 
 def erlang_c(agents, traffic):
     if agents <= traffic or agents == 0:
@@ -36,131 +38,141 @@ def find_agents_for_target(calls, interval_min, aht, target_asa):
     return max_agents
 
 
-def calculate_with_support(calls_a, calls_b, interval_min=30, aht=180, 
-                           target_asa=30, shrinkage=0.10):
+# ============= YARDIMLAŞMALI HESAPLAMA =============
+
+def calculate_with_support_single(calls_a, calls_b, interval_min=30, aht=180, 
+                                   target_asa=30, shrinkage=0.10):
     """
-    B agentları A'ya yardım eder
+    Tek interval için yardımlaşmalı agent hesaplama
     
     Mantık:
-    1. B kuyruğu için B agentları hesapla
-    2. Toplam çağrı (A+B) için gereken B agentı hesapla
+    1. B çağrıları için gereken B agent sayısını bul
+    2. Toplam (A+B) çağrıları için gereken B agent sayısını bul
     3. Eğer toplam için gereken ≤ B için gereken:
-       → B agentları hepsini karşılar, A agentı gerekmez
+       → B agentları yeterli, A agentı gerekmez
     4. Değilse:
-       → B agentları B'yi karşılar, A için ekstra A agentı gerek
-    
-    B agentları:
-    - B çağrılarını karşılar (öncelik)
-    - Boş kalırsa A'ya yardım eder
-    
-    A agentları:
-    - Sadece A çağrılarını karşılar
+       → B agentları sadece B'yi karşılar
+       → A çağrıları için A agentı gerek
     """
     
-    # 1. B kuyruğu için gereken B agentları
-    traffic_b = (calls_b * (aht/60)) / interval_min if calls_b > 0 else 0
-    agents_for_b = find_agents_for_target(calls_b, interval_min, aht, target_asa)
+    # 1. B çağrıları için B agent
+    b_agents_for_b = find_agents_for_target(calls_b, interval_min, aht, target_asa)
     
-    # 2. Toplam çağrı (A+B) için gereken agent
+    # 2. Toplam çağrı için B agent
     total_calls = calls_a + calls_b
-    traffic_total = (total_calls * (aht/60)) / interval_min if total_calls > 0 else 0
-    agents_for_total = find_agents_for_target(total_calls, interval_min, aht, target_asa)
+    b_agents_for_all = find_agents_for_target(total_calls, interval_min, aht, target_asa)
     
-    # 3. Karar: B agentları yeterli mi?
-    if agents_for_total <= agents_for_b:
+    # 3. Karar
+    if b_agents_for_all <= b_agents_for_b:
         # B agentları hem A hem B'yi karşılar
-        agents_b_needed = agents_for_total
-        agents_a_needed = 0
+        agents_b_raw = b_agents_for_all
+        agents_a_raw = 0
+        b_helps = True
     else:
-        # B agentları B'yi karşılar, A için ekstra gerek
-        agents_b_needed = agents_for_b
-        agents_a_needed = find_agents_for_target(calls_a, interval_min, aht, target_asa)
+        # B sadece B'yi karşılar, A için ayrı agent gerek
+        agents_b_raw = b_agents_for_b
+        agents_a_raw = find_agents_for_target(calls_a, interval_min, aht, target_asa)
+        b_helps = False
     
     # Shrinkage ekle
-    final_a = math.ceil(agents_a_needed / (1 - shrinkage))
-    final_b = math.ceil(agents_b_needed / (1 - shrinkage))
+    agents_a_final = math.ceil(agents_a_raw / (1 - shrinkage)) if agents_a_raw > 0 else 0
+    agents_b_final = math.ceil(agents_b_raw / (1 - shrinkage)) if agents_b_raw > 0 else 0
     
     return {
-        'calls_a': calls_a,
-        'calls_b': calls_b,
-        'traffic_b': round(traffic_b, 2),
-        'traffic_total': round(traffic_total, 2),
-        'agents_a': final_a,
-        'agents_b': final_b,
-        'total_agents': final_a + final_b,
-        'b_helps_a': agents_a_needed == 0  # B yardım etti mi?
+        'agents_a': agents_a_final,
+        'agents_b': agents_b_final,
+        'total': agents_a_final + agents_b_final,
+        'b_helps_a': b_helps
     }
 
 
-# TEST: BAĞIMSIZ vs YARDIMLAŞMALI KARŞILAŞTIRMA
-if __name__ == '__main__':
-    print("=" * 60)
-    print("ADIM 2: B AGENTLARI A'YA YARDIM EDER")
-    print("=" * 60)
+# ============= KARŞILAŞTIRMA =============
+
+def compare_methods_single(calls_a, calls_b):
+    """Bağımsız vs Yardımlaşmalı karşılaştır"""
     
-    # Test senaryosu
-    calls_a = 50
-    calls_b = 30
-    
-    print(f"\n📋 Senaryo:")
-    print(f"  A Çağrı: {calls_a}")
-    print(f"  B Çağrı: {calls_b}")
-    print(f"  Toplam: {calls_a + calls_b}\n")
-    
-    # YÖNTEM 1: Bağımsız (ADIM 1)
     print("=" * 60)
-    print("YÖNTEM 1: BAĞIMSIZ (Yardımlaşma Yok)")
+    print("KARŞILAŞTIRMA: BAĞIMSIZ vs YARDIMLAŞMALI")
     print("=" * 60)
     
-    traffic_a = (calls_a * 3) / 30
-    traffic_b = (calls_b * 3) / 30
-    agents_a_ind = find_agents_for_target(calls_a, 30, 180, 30)
-    agents_b_ind = find_agents_for_target(calls_b, 30, 180, 30)
-    agents_a_final_ind = math.ceil(agents_a_ind / 0.9)
-    agents_b_final_ind = math.ceil(agents_b_ind / 0.9)
-    total_ind = agents_a_final_ind + agents_b_final_ind
+    print(f"\n📋 Çağrılar: {calls_a} A + {calls_b} B\n")
     
-    print(f"A: {calls_a} çağrı (Traffic: {traffic_a:.1f}) → {agents_a_final_ind} agent")
-    print(f"B: {calls_b} çağrı (Traffic: {traffic_b:.1f}) → {agents_b_final_ind} agent")
-    print(f"TOPLAM: {total_ind} agent")
+    # BAĞIMSIZ
+    print("─" * 60)
+    print("YÖNTEM 1: BAĞIMSIZ")
+    print("─" * 60)
     
-    # YÖNTEM 2: Yardımlaşmalı (ADIM 2)
-    print("\n" + "=" * 60)
-    print("YÖNTEM 2: YARDIMLAŞMALI (B Agentları A'ya Yardım)")
-    print("=" * 60)
+    a_ind = find_agents_for_target(calls_a, 30, 180, 30)
+    b_ind = find_agents_for_target(calls_b, 30, 180, 30)
+    a_ind_final = math.ceil(a_ind / 0.9)
+    b_ind_final = math.ceil(b_ind / 0.9)
+    total_ind = a_ind_final + b_ind_final
     
-    result = calculate_with_support(calls_a, calls_b)
+    print(f"  A agentları: {a_ind_final} (sadece A çağrılarını karşılar)")
+    print(f"  B agentları: {b_ind_final} (sadece B çağrılarını karşılar)")
+    print(f"  TOPLAM: {total_ind}")
     
-    print(f"A: {result['calls_a']} çağrı → {result['agents_a']} agent")
-    print(f"B: {result['calls_b']} çağrı → {result['agents_b']} agent")
-    print(f"TOPLAM: {result['total_agents']} agent")
-    print(f"B yardım etti mi? {'✅ Evet' if result['b_helps_a'] else '❌ Hayır'}")
+    # YARDIMLAŞMALI
+    print("\n─" * 60)
+    print("YÖNTEM 2: YARDIMLAŞMALI")
+    print("─" * 60)
     
-    # Karşılaştırma
-    print("\n" + "=" * 60)
-    print("💰 TASARRUF ANALİZİ")
-    print("=" * 60)
+    result = calculate_with_support_single(calls_a, calls_b)
     
-    saving = total_ind - result['total_agents']
-    saving_pct = (saving / total_ind * 100) if total_ind > 0 else 0
+    print(f"  A agentları: {result['agents_a']} (sadece A)")
+    print(f"  B agentları: {result['agents_b']} (B + boşsa A'ya yardım)")
+    print(f"  TOPLAM: {result['total']}")
+    print(f"  B yardım etti mi? {'✅ Evet' if result['b_helps_a'] else '❌ Hayır'}")
     
-    print(f"Bağımsız: {total_ind} agent")
-    print(f"Yardımlaşmalı: {result['total_agents']} agent")
-    print(f"Tasarruf: {saving} agent ({saving_pct:.1f}%)")
+    # FARK
+    print("\n─" * 60)
+    print("💰 TASARRUF")
+    print("─" * 60)
     
-    if saving > 0:
-        print(f"\n✅ {saving} agent daha az gerekiyor!")
+    diff = total_ind - result['total']
+    pct = (diff / total_ind * 100) if total_ind > 0 else 0
+    
+    print(f"  Fark: {diff} agent ({pct:.1f}%)")
+    
+    if diff > 0:
+        print(f"  ✅ {diff} agent tasarruf!")
+    elif diff == 0:
+        print(f"  ⚠️ Fark yok (B çağrıları çok fazla)")
     else:
-        print(f"\n⚠️ Bu senaryoda fark yok")
+        print(f"  ❌ Hata var!")
     
+    return {
+        'independent': total_ind,
+        'support': result['total'],
+        'saving': diff
+    }
+
+
+# ============= TEST =============
+
+if __name__ == '__main__':
+    
+    # Test 1: B çağrıları az
     print("\n" + "=" * 60)
-    print("💡 MANTIK:")
+    print("TEST 1: B ÇAĞRILARI AZ")
     print("=" * 60)
-    print("Bağımsız:")
-    print("  A agentları: Sadece A")
-    print("  B agentları: Sadece B")
-    print("  → Her kuyruk kendi başına\n")
-    print("Yardımlaşmalı:")
-    print("  A agentları: Sadece A")
-    print("  B agentları: B + boşsa A'ya yardım")
-    print("  → B agentları çift görev!")
+    compare_methods_single(calls_a=50, calls_b=10)
+    
+    # Test 2: B çağrıları orta
+    print("\n\n" + "=" * 60)
+    print("TEST 2: B ÇAĞRILARI ORTA")
+    print("=" * 60)
+    compare_methods_single(calls_a=50, calls_b=30)
+    
+    # Test 3: B çağrıları çok
+    print("\n\n" + "=" * 60)
+    print("TEST 3: B ÇAĞRILARI ÇOK")
+    print("=" * 60)
+    compare_methods_single(calls_a=30, calls_b=50)
+    
+    print("\n\n" + "=" * 60)
+    print("💡 SONUÇ:")
+    print("=" * 60)
+    print("B çağrıları az → B agentları A'ya yardım eder → Tasarruf!")
+    print("B çağrıları çok → B agentları sadece B'yi karşılar → Tasarruf yok")
+    print("\n➡️ Sonraki: DataFrame ile tüm gün hesaplama")
