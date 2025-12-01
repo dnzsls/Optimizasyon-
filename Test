@@ -1,7 +1,8 @@
 """
-FONKSİYON 6: Tek Interval için Tam Hesaplama
-A ve B kuyruğu için agent hesapla - BAĞIMSIZ (yardımlaşma yok)
+FONKSİYON 7: Tüm Gün için Hesaplama (DataFrame)
+Kendi DataFrame'inle çalış - 48 interval birden!
 """
+import pandas as pd
 import math
 
 def erlang_c(agents, traffic):
@@ -35,110 +36,102 @@ def find_agents_for_target(calls, interval_min, aht, target_asa):
     return max_agents
 
 
-def calculate_single_interval(calls_a, calls_b, interval_min=30, aht=180, 
-                              target_asa=30, shrinkage=0.10):
+def calculate_full_day(df, interval_min=30, aht=180, target_asa=30, shrinkage=0.10):
     """
-    Tek bir zaman dilimi için agent hesapla
+    Tüm gün için agent hesapla
     
-    BAĞIMSIZ YAKLAŞIM:
-    - A kuyruğu → A agentları karşılar
-    - B kuyruğu → B agentları karşılar
-    - Yardımlaşma YOK
+    DataFrame formatı:
+    - time: '00:00', '00:30', '01:00', ...
+    - queue_a: A kuyruğu çağrı sayısı
+    - queue_b: B kuyruğu çağrı sayısı
     
-    Parametreler:
-    - calls_a: A kuyruğuna gelen çağrı
-    - calls_b: B kuyruğuna gelen çağrı
-    - interval_min: İnterval (dakika)
-    - aht: Average Handle Time (saniye)
-    - target_asa: Hedef ASA (saniye)
-    - shrinkage: Shrinkage oranı (0.10 = %10)
+    BAĞIMSIZ yaklaşım (yardımlaşma yok)
     
     Dönüş:
-    - Sözlük (agents_a, agents_b, total, detaylar)
+    - Yeni DataFrame (time, calls, agents, traffic)
     """
+    results = []
     
-    # A kuyruğu için
-    agents_a_raw = find_agents_for_target(calls_a, interval_min, aht, target_asa)
-    agents_a_final = math.ceil(agents_a_raw / (1 - shrinkage))
+    for idx, row in df.iterrows():
+        time = row['time']
+        calls_a = row['queue_a']
+        calls_b = row['queue_b']
+        
+        # A kuyruğu
+        traffic_a = (calls_a * (aht/60)) / interval_min if calls_a > 0 else 0
+        agents_a_raw = find_agents_for_target(calls_a, interval_min, aht, target_asa)
+        agents_a_final = math.ceil(agents_a_raw / (1 - shrinkage))
+        
+        # B kuyruğu
+        traffic_b = (calls_b * (aht/60)) / interval_min if calls_b > 0 else 0
+        agents_b_raw = find_agents_for_target(calls_b, interval_min, aht, target_asa)
+        agents_b_final = math.ceil(agents_b_raw / (1 - shrinkage))
+        
+        results.append({
+            'time': time,
+            'calls_a': calls_a,
+            'calls_b': calls_b,
+            'traffic_a': round(traffic_a, 2),
+            'traffic_b': round(traffic_b, 2),
+            'agents_a': agents_a_final,
+            'agents_b': agents_b_final,
+            'total_agents': agents_a_final + agents_b_final
+        })
     
-    # B kuyruğu için
-    agents_b_raw = find_agents_for_target(calls_b, interval_min, aht, target_asa)
-    agents_b_final = math.ceil(agents_b_raw / (1 - shrinkage))
-    
-    # Traffic hesapla (doğrulama için)
-    traffic_a = (calls_a * (aht/60)) / interval_min if calls_a > 0 else 0
-    traffic_b = (calls_b * (aht/60)) / interval_min if calls_b > 0 else 0
-    
-    return {
-        'calls_a': calls_a,
-        'calls_b': calls_b,
-        'traffic_a': round(traffic_a, 2),
-        'traffic_b': round(traffic_b, 2),
-        'agents_a_raw': agents_a_raw,
-        'agents_b_raw': agents_b_raw,
-        'agents_a_final': agents_a_final,
-        'agents_b_final': agents_b_final,
-        'total_agents': agents_a_final + agents_b_final
-    }
+    return pd.DataFrame(results)
 
 
-# TEST EDELİM
+# TEST EDELİM - KENDİ VERİNLE ÇALIŞIR!
 if __name__ == '__main__':
     print("=" * 60)
-    print("FONKSİYON 6: TEK INTERVAL TAM HESAPLAMA")
+    print("FONKSİYON 7: TÜM GÜN HESAPLAMA")
     print("=" * 60)
     
-    print("\n📋 Senaryo:")
-    print("  - 09:00-09:30 zaman dilimi")
-    print("  - A kuyruğu: 50 çağrı")
-    print("  - B kuyruğu: 30 çağrı")
-    print("  - BAĞIMSIZ hesaplama (yardımlaşma yok)\n")
+    # Örnek veri oluştur (senin verin böyle olacak)
+    sample_data = pd.DataFrame({
+        'time': ['00:00', '00:30', '01:00', '01:30', '08:00', '08:30', 
+                 '09:00', '09:30', '17:00', '17:30', '23:00', '23:30'],
+        'queue_a': [5, 5, 5, 5, 30, 40, 50, 55, 35, 30, 10, 8],
+        'queue_b': [3, 3, 3, 3, 15, 20, 30, 35, 20, 15, 5, 4]
+    })
     
-    # Test 1: Orta yoğun
-    result = calculate_single_interval(calls_a=50, calls_b=30)
+    print("\n📋 Örnek Veri (ilk 6 satır):")
+    print(sample_data.head(6))
     
-    print("=" * 60)
+    # Hesapla
+    print("\n⚙️ Hesaplama yapılıyor...")
+    result = calculate_full_day(sample_data)
+    
+    # Sonuçları göster
+    print("\n" + "=" * 60)
     print("📊 SONUÇLAR")
     print("=" * 60)
+    print("\nTüm sonuçlar:")
+    print(result.to_string(index=False))
     
-    print(f"\n🔹 A Kuyruğu:")
-    print(f"   Çağrı: {result['calls_a']}")
-    print(f"   Traffic: {result['traffic_a']} Erlang")
-    print(f"   Ham Agent: {result['agents_a_raw']}")
-    print(f"   +Shrinkage: {result['agents_a_final']} agent")
-    
-    print(f"\n🔹 B Kuyruğu:")
-    print(f"   Çağrı: {result['calls_b']}")
-    print(f"   Traffic: {result['traffic_b']} Erlang")
-    print(f"   Ham Agent: {result['agents_b_raw']}")
-    print(f"   +Shrinkage: {result['agents_b_final']} agent")
-    
-    print(f"\n🔹 TOPLAM:")
-    print(f"   Toplam Çağrı: {result['calls_a'] + result['calls_b']}")
-    print(f"   Toplam Agent: {result['total_agents']}")
-    
-    # Test 2: Düşük yoğun
-    print("\n\n" + "=" * 60)
-    print("TEST 2: DÜŞÜK YOĞUN")
-    print("=" * 60)
-    result2 = calculate_single_interval(calls_a=20, calls_b=10)
-    print(f"A: {result2['calls_a']} çağrı → {result2['agents_a_final']} agent")
-    print(f"B: {result2['calls_b']} çağrı → {result2['agents_b_final']} agent")
-    print(f"Toplam: {result2['total_agents']} agent")
-    
-    # Test 3: Yüksek yoğun
+    # Özet istatistikler
     print("\n" + "=" * 60)
-    print("TEST 3: YÜKSEK YOĞUN")
+    print("📈 ÖZET")
     print("=" * 60)
-    result3 = calculate_single_interval(calls_a=100, calls_b=60)
-    print(f"A: {result3['calls_a']} çağrı → {result3['agents_a_final']} agent")
-    print(f"B: {result3['calls_b']} çağrı → {result3['agents_b_final']} agent")
-    print(f"Toplam: {result3['total_agents']} agent")
+    print(f"Toplam Çağrı A: {result['calls_a'].sum()}")
+    print(f"Toplam Çağrı B: {result['calls_b'].sum()}")
+    print(f"Peak Saat: {result.loc[result['total_agents'].idxmax(), 'time']}")
+    print(f"Peak Agent: {result['total_agents'].max()}")
+    print(f"Ortalama Agent: {result['total_agents'].mean():.1f}")
+    
+    # Peak saat detayı
+    peak_idx = result['total_agents'].idxmax()
+    peak_row = result.iloc[peak_idx]
+    
+    print(f"\n🔍 Peak Saat Detayı ({peak_row['time']}):")
+    print(f"  A: {peak_row['calls_a']} çağrı → {peak_row['agents_a']} agent")
+    print(f"  B: {peak_row['calls_b']} çağrı → {peak_row['agents_b']} agent")
+    print(f"  Toplam: {peak_row['total_agents']} agent")
     
     print("\n" + "=" * 60)
-    print("💡 ÖĞRENME:")
-    print("  Bu fonksiyon TEK BİR zaman dilimi için hesaplıyor")
-    print("  Gerçek projede: 48 interval var (24 saat × 2)")
-    print("  Hepsini tek tek hesaplayacağız")
+    print("✅ BU FONKSİYON KENDİ VERİNLE ÇALIŞIR!")
     print("=" * 60)
-    print("\n➡️ Sonraki: Tüm gün için hesaplama (DataFrame ile)")
+    print("\nKullanım:")
+    print("  df = pd.read_excel('cagrilar.xlsx')")
+    print("  result = calculate_full_day(df)")
+    print("  result.to_excel('agent_ihtiyaci.xlsx')")
