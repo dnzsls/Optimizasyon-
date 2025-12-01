@@ -1,6 +1,6 @@
 """
-FONKSİYON 5: Shrinkage Ekleme
-Gerçek dünya: Agentlar %100 verimli çalışamaz
+FONKSİYON 6: Tek Interval için Tam Hesaplama
+A ve B kuyruğu için agent hesapla - BAĞIMSIZ (yardımlaşma yok)
 """
 import math
 
@@ -26,10 +26,8 @@ def find_agents_for_target(calls, interval_min, aht, target_asa):
     traffic = (calls * (aht / 60)) / interval_min
     if traffic == 0:
         return 0
-    
     min_agents = math.ceil(traffic)
-    max_agents = math.ceil(traffic * 2) + 5  # ✅ Güncellendi!
-    
+    max_agents = math.ceil(traffic * 2) + 5
     for agents in range(min_agents, max_agents + 1):
         asa = calculate_asa(agents, traffic, aht)
         if asa <= target_asa:
@@ -37,84 +35,110 @@ def find_agents_for_target(calls, interval_min, aht, target_asa):
     return max_agents
 
 
-def apply_shrinkage(raw_agents, shrinkage_pct):
+def calculate_single_interval(calls_a, calls_b, interval_min=30, aht=180, 
+                              target_asa=30, shrinkage=0.10):
     """
-    Shrinkage uygula
+    Tek bir zaman dilimi için agent hesapla
     
-    Ne demek?
-    - Agentlar mola, tuvalet, eğitim, izin yapıyor
-    - %10 shrinkage = Agentlar zamanın %10'unda çalışmıyor
-    - O yüzden daha fazla agent çalıştırmalıyız
+    BAĞIMSIZ YAKLAŞIM:
+    - A kuyruğu → A agentları karşılar
+    - B kuyruğu → B agentları karşılar
+    - Yardımlaşma YOK
     
-    Formül:
-    Final Agent = Ham Agent / (1 - Shrinkage)
+    Parametreler:
+    - calls_a: A kuyruğuna gelen çağrı
+    - calls_b: B kuyruğuna gelen çağrı
+    - interval_min: İnterval (dakika)
+    - aht: Average Handle Time (saniye)
+    - target_asa: Hedef ASA (saniye)
+    - shrinkage: Shrinkage oranı (0.10 = %10)
     
-    Örnek:
-    - 10 agent gerekiyor
-    - %10 shrinkage
-    - Final = 10 / 0.9 = 11.1 → 12 agent
+    Dönüş:
+    - Sözlük (agents_a, agents_b, total, detaylar)
     """
-    final_agents = raw_agents / (1 - shrinkage_pct)
-    return math.ceil(final_agents)  # Yukarı yuvarla
+    
+    # A kuyruğu için
+    agents_a_raw = find_agents_for_target(calls_a, interval_min, aht, target_asa)
+    agents_a_final = math.ceil(agents_a_raw / (1 - shrinkage))
+    
+    # B kuyruğu için
+    agents_b_raw = find_agents_for_target(calls_b, interval_min, aht, target_asa)
+    agents_b_final = math.ceil(agents_b_raw / (1 - shrinkage))
+    
+    # Traffic hesapla (doğrulama için)
+    traffic_a = (calls_a * (aht/60)) / interval_min if calls_a > 0 else 0
+    traffic_b = (calls_b * (aht/60)) / interval_min if calls_b > 0 else 0
+    
+    return {
+        'calls_a': calls_a,
+        'calls_b': calls_b,
+        'traffic_a': round(traffic_a, 2),
+        'traffic_b': round(traffic_b, 2),
+        'agents_a_raw': agents_a_raw,
+        'agents_b_raw': agents_b_raw,
+        'agents_a_final': agents_a_final,
+        'agents_b_final': agents_b_final,
+        'total_agents': agents_a_final + agents_b_final
+    }
 
 
 # TEST EDELİM
 if __name__ == '__main__':
     print("=" * 60)
-    print("FONKSİYON 5: SHRINKAGE")
+    print("FONKSİYON 6: TEK INTERVAL TAM HESAPLAMA")
     print("=" * 60)
     
-    print("\n💡 Shrinkage Nedir?")
-    print("  Agentlar sürekli çalışamaz:")
-    print("  - Mola: 15 dakika")
-    print("  - Tuvalet: 5 dakika")
-    print("  - Toplantı/Eğitim: 30 dakika")
-    print("  - Sistem problemi: 10 dakika")
-    print("  → Toplam ~60 dakika = %10 shrinkage (8 saatte)\n")
+    print("\n📋 Senaryo:")
+    print("  - 09:00-09:30 zaman dilimi")
+    print("  - A kuyruğu: 50 çağrı")
+    print("  - B kuyruğu: 30 çağrı")
+    print("  - BAĞIMSIZ hesaplama (yardımlaşma yok)\n")
     
-    # Parametreler
-    calls = 50
-    interval = 30
-    aht = 180
-    target = 30
-    shrinkage = 0.10  # %10
+    # Test 1: Orta yoğun
+    result = calculate_single_interval(calls_a=50, calls_b=30)
     
-    # 1. Ham agent hesapla
-    raw_agents = find_agents_for_target(calls, interval, aht, target)
-    
-    # 2. Shrinkage uygula
-    final_agents = apply_shrinkage(raw_agents, shrinkage)
-    
-    # Karşılaştırma
-    traffic = (calls * (aht/60)) / interval
-    
-    print(f"Senaryo: {calls} çağrı, {interval} dakika interval")
-    print(f"Traffic: {traffic:.1f} Erlang\n")
-    
-    print(f"1️⃣ Ham Hesaplama (Shrinkage yok):")
-    print(f"   Gereken agent: {raw_agents}")
-    print(f"   ASA: {calculate_asa(raw_agents, traffic, aht):.1f} sn\n")
-    
-    print(f"2️⃣ Shrinkage ile ({shrinkage*100:.0f}%):")
-    print(f"   Final agent: {final_agents}")
-    print(f"   Fark: +{final_agents - raw_agents} agent")
-    print(f"   Neden? Agentlar zamanın %{shrinkage*100:.0f}'u çalışmıyor\n")
-    
-    # Farklı shrinkage oranları
     print("=" * 60)
-    print("📊 FARKLI SHRINKAGE ORANLARI")
+    print("📊 SONUÇLAR")
     print("=" * 60)
-    print(f"\nHam agent ihtiyacı: {raw_agents}\n")
     
-    for shrink in [0.05, 0.10, 0.15, 0.20]:
-        final = apply_shrinkage(raw_agents, shrink)
-        diff = final - raw_agents
-        print(f"Shrinkage %{shrink*100:.0f}: {final} agent (+{diff})")
+    print(f"\n🔹 A Kuyruğu:")
+    print(f"   Çağrı: {result['calls_a']}")
+    print(f"   Traffic: {result['traffic_a']} Erlang")
+    print(f"   Ham Agent: {result['agents_a_raw']}")
+    print(f"   +Shrinkage: {result['agents_a_final']} agent")
+    
+    print(f"\n🔹 B Kuyruğu:")
+    print(f"   Çağrı: {result['calls_b']}")
+    print(f"   Traffic: {result['traffic_b']} Erlang")
+    print(f"   Ham Agent: {result['agents_b_raw']}")
+    print(f"   +Shrinkage: {result['agents_b_final']} agent")
+    
+    print(f"\n🔹 TOPLAM:")
+    print(f"   Toplam Çağrı: {result['calls_a'] + result['calls_b']}")
+    print(f"   Toplam Agent: {result['total_agents']}")
+    
+    # Test 2: Düşük yoğun
+    print("\n\n" + "=" * 60)
+    print("TEST 2: DÜŞÜK YOĞUN")
+    print("=" * 60)
+    result2 = calculate_single_interval(calls_a=20, calls_b=10)
+    print(f"A: {result2['calls_a']} çağrı → {result2['agents_a_final']} agent")
+    print(f"B: {result2['calls_b']} çağrı → {result2['agents_b_final']} agent")
+    print(f"Toplam: {result2['total_agents']} agent")
+    
+    # Test 3: Yüksek yoğun
+    print("\n" + "=" * 60)
+    print("TEST 3: YÜKSEK YOĞUN")
+    print("=" * 60)
+    result3 = calculate_single_interval(calls_a=100, calls_b=60)
+    print(f"A: {result3['calls_a']} çağrı → {result3['agents_a_final']} agent")
+    print(f"B: {result3['calls_b']} çağrı → {result3['agents_b_final']} agent")
+    print(f"Toplam: {result3['total_agents']} agent")
     
     print("\n" + "=" * 60)
     print("💡 ÖĞRENME:")
-    print("  - Ham hesaplama = Teorik minimum")
-    print("  - Shrinkage = Gerçek dünya payı")
-    print("  - Her zaman shrinkage ekle!")
+    print("  Bu fonksiyon TEK BİR zaman dilimi için hesaplıyor")
+    print("  Gerçek projede: 48 interval var (24 saat × 2)")
+    print("  Hepsini tek tek hesaplayacağız")
     print("=" * 60)
-    print("\n➡️ Sonraki: Tek bir interval için tam hesaplama")
+    print("\n➡️ Sonraki: Tüm gün için hesaplama (DataFrame ile)")
