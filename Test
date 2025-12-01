@@ -1,11 +1,10 @@
 """
-FONKSİYON 4: Hedef ASA için Agent Sayısı Bulma
-Otomatik olarak kaç agent gerektiğini bulur
+FONKSİYON 5: Shrinkage Ekleme
+Gerçek dünya: Agentlar %100 verimli çalışamaz
 """
 import math
 
 def erlang_c(agents, traffic):
-    """Bekleme olasılığı"""
     if agents <= traffic or agents == 0:
         return 1.0
     erlang_b = traffic / agents
@@ -14,113 +13,108 @@ def erlang_c(agents, traffic):
     erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
     return min(erlang_c_val, 1.0)
 
-
 def calculate_asa(agents, traffic, aht):
-    """ASA hesapla"""
     if agents <= traffic:
         return 999
     ec = erlang_c(agents, traffic)
     asa = (ec * (aht / 60)) / (agents - traffic) * 60
     return asa
 
-
 def find_agents_for_target(calls, interval_min, aht, target_asa):
-    """
-    Hedef ASA için gereken minimum agent sayısını bul
-    
-    Nasıl çalışır?
-    1. Traffic hesapla
-    2. Minimum agent'tan başla (= traffic)
-    3. Her sayıyı dene, ASA hesapla
-    4. Hedefi karşılayan ilk sayıyı döndür
-    
-    Parametreler:
-    - calls: Çağrı sayısı
-    - interval_min: İnterval (dakika)
-    - aht: Average Handle Time (saniye)
-    - target_asa: Hedef ASA (saniye)
-    
-    Dönüş:
-    - Gereken agent sayısı
-    """
     if calls == 0:
         return 0
-    
-    # 1. Traffic hesapla
     traffic = (calls * (aht / 60)) / interval_min
-    
     if traffic == 0:
         return 0
     
-    # 2. Arama aralığı
-    min_agents = math.ceil(traffic)  # En az traffic kadar
-    max_agents = math.ceil(traffic * 3) + 10  # Üst limit
+    min_agents = math.ceil(traffic)
+    max_agents = math.ceil(traffic * 2) + 5  # ✅ Güncellendi!
     
-    # 3. Her sayıyı dene
     for agents in range(min_agents, max_agents + 1):
         asa = calculate_asa(agents, traffic, aht)
-        
         if asa <= target_asa:
-            return agents  # İlk karşılayan sayı = optimal
+            return agents
+    return max_agents
+
+
+def apply_shrinkage(raw_agents, shrinkage_pct):
+    """
+    Shrinkage uygula
     
-    return max_agents  # Bulunamadıysa max döndür
+    Ne demek?
+    - Agentlar mola, tuvalet, eğitim, izin yapıyor
+    - %10 shrinkage = Agentlar zamanın %10'unda çalışmıyor
+    - O yüzden daha fazla agent çalıştırmalıyız
+    
+    Formül:
+    Final Agent = Ham Agent / (1 - Shrinkage)
+    
+    Örnek:
+    - 10 agent gerekiyor
+    - %10 shrinkage
+    - Final = 10 / 0.9 = 11.1 → 12 agent
+    """
+    final_agents = raw_agents / (1 - shrinkage_pct)
+    return math.ceil(final_agents)  # Yukarı yuvarla
 
 
 # TEST EDELİM
 if __name__ == '__main__':
     print("=" * 60)
-    print("FONKSİYON 4: OTOMATİK AGENT BULMA")
+    print("FONKSİYON 5: SHRINKAGE")
     print("=" * 60)
     
+    print("\n💡 Shrinkage Nedir?")
+    print("  Agentlar sürekli çalışamaz:")
+    print("  - Mola: 15 dakika")
+    print("  - Tuvalet: 5 dakika")
+    print("  - Toplantı/Eğitim: 30 dakika")
+    print("  - Sistem problemi: 10 dakika")
+    print("  → Toplam ~60 dakika = %10 shrinkage (8 saatte)\n")
+    
     # Parametreler
+    calls = 50
     interval = 30
     aht = 180
-    target = 30  # 30 saniye hedef
+    target = 30
+    shrinkage = 0.10  # %10
     
-    print(f"\nSabit:")
-    print(f"  İnterval: {interval} dakika")
-    print(f"  AHT: {aht} saniye")
-    print(f"  Hedef ASA: {target} saniye\n")
+    # 1. Ham agent hesapla
+    raw_agents = find_agents_for_target(calls, interval, aht, target)
     
-    # Test 1: 50 çağrı
-    calls1 = 50
-    traffic1 = (calls1 * (aht/60)) / interval
-    agents1 = find_agents_for_target(calls1, interval, aht, target)
-    asa1 = calculate_asa(agents1, traffic1, aht)
+    # 2. Shrinkage uygula
+    final_agents = apply_shrinkage(raw_agents, shrinkage)
     
-    print(f"Test 1: {calls1} çağrı")
-    print(f"  Traffic: {traffic1:.1f} Erlang")
-    print(f"  Bulunan Agent: {agents1}")
-    print(f"  Gerçek ASA: {asa1:.1f} saniye")
-    print(f"  Hedef karşılandı mı? {'✅ Evet' if asa1 <= target else '❌ Hayır'}")
+    # Karşılaştırma
+    traffic = (calls * (aht/60)) / interval
     
-    # Test 2: 100 çağrı
-    calls2 = 100
-    traffic2 = (calls2 * (aht/60)) / interval
-    agents2 = find_agents_for_target(calls2, interval, aht, target)
-    asa2 = calculate_asa(agents2, traffic2, aht)
+    print(f"Senaryo: {calls} çağrı, {interval} dakika interval")
+    print(f"Traffic: {traffic:.1f} Erlang\n")
     
-    print(f"\nTest 2: {calls2} çağrı")
-    print(f"  Traffic: {traffic2:.1f} Erlang")
-    print(f"  Bulunan Agent: {agents2}")
-    print(f"  Gerçek ASA: {asa2:.1f} saniye")
-    print(f"  Hedef karşılandı mı? {'✅ Evet' if asa2 <= target else '❌ Hayır'}")
+    print(f"1️⃣ Ham Hesaplama (Shrinkage yok):")
+    print(f"   Gereken agent: {raw_agents}")
+    print(f"   ASA: {calculate_asa(raw_agents, traffic, aht):.1f} sn\n")
     
-    # Test 3: 20 çağrı (az yoğun)
-    calls3 = 20
-    traffic3 = (calls3 * (aht/60)) / interval
-    agents3 = find_agents_for_target(calls3, interval, aht, target)
-    asa3 = calculate_asa(agents3, traffic3, aht)
+    print(f"2️⃣ Shrinkage ile ({shrinkage*100:.0f}%):")
+    print(f"   Final agent: {final_agents}")
+    print(f"   Fark: +{final_agents - raw_agents} agent")
+    print(f"   Neden? Agentlar zamanın %{shrinkage*100:.0f}'u çalışmıyor\n")
     
-    print(f"\nTest 3: {calls3} çağrı")
-    print(f"  Traffic: {traffic3:.1f} Erlang")
-    print(f"  Bulunan Agent: {agents3}")
-    print(f"  Gerçek ASA: {asa3:.1f} saniye")
-    print(f"  Hedef karşılandı mı? {'✅ Evet' if asa3 <= target else '❌ Hayır'}")
+    # Farklı shrinkage oranları
+    print("=" * 60)
+    print("📊 FARKLI SHRINKAGE ORANLARI")
+    print("=" * 60)
+    print(f"\nHam agent ihtiyacı: {raw_agents}\n")
+    
+    for shrink in [0.05, 0.10, 0.15, 0.20]:
+        final = apply_shrinkage(raw_agents, shrink)
+        diff = final - raw_agents
+        print(f"Shrinkage %{shrink*100:.0f}: {final} agent (+{diff})")
     
     print("\n" + "=" * 60)
     print("💡 ÖĞRENME:")
-    print("  Bu fonksiyon 'kaç agent?' sorusunu otomatik cevaplıyor")
-    print("  Elle denemeden direkt optimal sayıyı buluyor")
+    print("  - Ham hesaplama = Teorik minimum")
+    print("  - Shrinkage = Gerçek dünya payı")
+    print("  - Her zaman shrinkage ekle!")
     print("=" * 60)
-    print("\n➡️ Sonraki: Shrinkage ekleyip tam hesaplama")
+    print("\n➡️ Sonraki: Tek bir interval için tam hesaplama")
