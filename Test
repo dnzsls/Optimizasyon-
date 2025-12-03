@@ -1,6 +1,6 @@
 """
-Interval Bazlı Agent Hesaplama - Yardımlaşmalı
-B agentları B çağrılarını karşılar, boş kalırsa A'ya yardım eder
+19 Vardiya ile Kapasite Planlama
+Yardımlaşma YOK - Bağımsız hesaplama
 """
 import pandas as pd
 import math
@@ -37,142 +37,211 @@ def find_agents_for_target(calls, interval_min, aht, target_asa):
             return agents
     return max_agents
 
+def time_to_minutes(time_str):
+    """'07:30' → 450 dakika"""
+    h, m = map(int, time_str.split(':'))
+    return h * 60 + m
 
-# ============= YARDIMLAŞMALI HESAPLAMA =============
+def is_time_in_shift(time_str, shift_start, shift_end):
+    """Bir zaman vardiya içinde mi kontrol et (gece vardiyası dahil)"""
+    time_min = time_to_minutes(time_str)
+    start_min = time_to_minutes(shift_start)
+    end_min = time_to_minutes(shift_end)
+    
+    if end_min <= start_min:  # Gece vardiyası
+        return time_min >= start_min or time_min < end_min
+    else:  # Normal vardiya
+        return start_min <= time_min < end_min
 
-def calculate_with_support_single(calls_a, calls_b, interval_min=30, aht=180, 
-                                   target_asa=30, shrinkage=0.10):
-    """
-    Tek interval için yardımlaşmalı agent hesaplama
+
+# ============= 19 VARDİYA TANIMI =============
+
+# A21 Firma Vardiyaları (Sol kolon)
+SHIFTS_A21 = [
+    {'name': 'V1', 'start': '07:00', 'end': '16:00', 'duration': 9.0},
+    {'name': 'V2', 'start': '08:00', 'end': '17:00', 'duration': 9.0},
+    {'name': 'V3', 'start': '09:00', 'end': '18:00', 'duration': 9.0},
+    {'name': 'V4', 'start': '10:00', 'end': '19:00', 'duration': 9.0},
+    {'name': 'V5', 'start': '15:00', 'end': '24:00', 'duration': 9.0},
+    {'name': 'V6', 'start': '17:00', 'end': '01:00', 'duration': 8.0},
+    {'name': 'V7', 'start': '18:00', 'end': '02:00', 'duration': 8.0},
+    {'name': 'V8', 'start': '19:00', 'end': '03:00', 'duration': 8.0},
+    {'name': 'V9', 'start': '00:00', 'end': '08:00', 'duration': 8.0},
+]
+
+# B21 Firma Vardiyaları (Sağ kolon - buçuklu saatler)
+SHIFTS_B21 = [
+    {'name': 'V10', 'start': '08:00', 'end': '17:30', 'duration': 9.5},
+    {'name': 'V11', 'start': '09:00', 'end': '18:30', 'duration': 9.5},
+    {'name': 'V12', 'start': '10:00', 'end': '19:30', 'duration': 9.5},
+    {'name': 'V13', 'start': '11:00', 'end': '20:30', 'duration': 9.5},
+    {'name': 'V14', 'start': '12:00', 'end': '21:30', 'duration': 9.5},
+    {'name': 'V15', 'start': '13:00', 'end': '22:30', 'duration': 9.5},
+    {'name': 'V16', 'start': '14:00', 'end': '23:30', 'duration': 9.5},
+    {'name': 'V17', 'start': '15:00', 'end': '00:30', 'duration': 9.5},
+    {'name': 'V18', 'start': '17:00', 'end': '01:30', 'duration': 8.5},
+    {'name': 'V19', 'start': '18:00', 'end': '02:30', 'duration': 8.5},
+]
+
+ALL_SHIFTS = SHIFTS_A21 + SHIFTS_B21
+
+
+# ============= INTERVAL BAZLI İHTİYAÇ =============
+
+def calculate_interval_requirements(df, interval_min=30, aht=180, 
+                                    target_asa=30, shrinkage=0.10):
+    """Her interval için agent ihtiyacı (BAĞIMSIZ)"""
+    results = []
     
-    Mantık:
-    1. B çağrıları için gereken B agent sayısını bul
-    2. Toplam (A+B) çağrıları için gereken B agent sayısını bul
-    3. Eğer toplam için gereken ≤ B için gereken:
-       → B agentları yeterli, A agentı gerekmez
-    4. Değilse:
-       → B agentları sadece B'yi karşılar
-       → A çağrıları için A agentı gerek
-    """
-    
-    # 1. B çağrıları için B agent
-    b_agents_for_b = find_agents_for_target(calls_b, interval_min, aht, target_asa)
-    
-    # 2. Toplam çağrı için B agent
-    total_calls = calls_a + calls_b
-    b_agents_for_all = find_agents_for_target(total_calls, interval_min, aht, target_asa)
-    
-    # 3. Karar
-    if b_agents_for_all <= b_agents_for_b:
-        # B agentları hem A hem B'yi karşılar
-        agents_b_raw = b_agents_for_all
-        agents_a_raw = 0
-        b_helps = True
-    else:
-        # B sadece B'yi karşılar, A için ayrı agent gerek
-        agents_b_raw = b_agents_for_b
+    for idx, row in df.iterrows():
+        calls_a = row['queue_a']
+        calls_b = row['queue_b']
+        
+        # A için
         agents_a_raw = find_agents_for_target(calls_a, interval_min, aht, target_asa)
-        b_helps = False
+        agents_a_final = math.ceil(agents_a_raw / (1 - shrinkage))
+        
+        # B için
+        agents_b_raw = find_agents_for_target(calls_b, interval_min, aht, target_asa)
+        agents_b_final = math.ceil(agents_b_raw / (1 - shrinkage))
+        
+        results.append({
+            'time': row['time'],
+            'calls_a': calls_a,
+            'calls_b': calls_b,
+            'agents_a': agents_a_final,
+            'agents_b': agents_b_final,
+            'total_agents': agents_a_final + agents_b_final
+        })
     
-    # Shrinkage ekle
-    agents_a_final = math.ceil(agents_a_raw / (1 - shrinkage)) if agents_a_raw > 0 else 0
-    agents_b_final = math.ceil(agents_b_raw / (1 - shrinkage)) if agents_b_raw > 0 else 0
-    
-    return {
-        'agents_a': agents_a_final,
-        'agents_b': agents_b_final,
-        'total': agents_a_final + agents_b_final,
-        'b_helps_a': b_helps
-    }
+    return pd.DataFrame(results)
 
 
-# ============= KARŞILAŞTIRMA =============
+# ============= VARDİYA BAZLI İHTİYAÇ =============
 
-def compare_methods_single(calls_a, calls_b):
-    """Bağımsız vs Yardımlaşmalı karşılaştır"""
+def calculate_shift_requirements(interval_df, shifts):
+    """Vardiya bazlı agent ihtiyacı"""
+    shift_results = []
     
-    print("=" * 60)
-    print("KARŞILAŞTIRMA: BAĞIMSIZ vs YARDIMLAŞMALI")
-    print("=" * 60)
+    for shift in shifts:
+        shift_intervals = interval_df[
+            interval_df['time'].apply(
+                lambda t: is_time_in_shift(t, shift['start'], shift['end'])
+            )
+        ]
+        
+        if len(shift_intervals) == 0:
+            agents_a = 0
+            agents_b = 0
+            max_total = 0
+        else:
+            agents_a = shift_intervals['agents_a'].max()
+            agents_b = shift_intervals['agents_b'].max()
+            max_total = shift_intervals['total_agents'].max()
+        
+        shift_results.append({
+            'shift': shift['name'],
+            'start': shift['start'],
+            'end': shift['end'],
+            'duration': shift['duration'],
+            'agents_a': int(agents_a),
+            'agents_b': int(agents_b),
+            'total': int(max_total),
+            'intervals': len(shift_intervals)
+        })
     
-    print(f"\n📋 Çağrılar: {calls_a} A + {calls_b} B\n")
+    return pd.DataFrame(shift_results)
+
+
+# ============= ANA FONKSİYON =============
+
+def calculate_all(df):
+    """Tüm hesaplama - Interval ve Vardiya"""
     
-    # BAĞIMSIZ
-    print("─" * 60)
-    print("YÖNTEM 1: BAĞIMSIZ")
-    print("─" * 60)
+    print("=" * 70)
+    print("KAPASİTE PLANLAMA - 19 VARDİYA")
+    print("=" * 70)
     
-    a_ind = find_agents_for_target(calls_a, 30, 180, 30)
-    b_ind = find_agents_for_target(calls_b, 30, 180, 30)
-    a_ind_final = math.ceil(a_ind / 0.9)
-    b_ind_final = math.ceil(b_ind / 0.9)
-    total_ind = a_ind_final + b_ind_final
+    # ADIM 1: Interval bazlı
+    print("\n⚙️ ADIM 1: Interval bazlı hesaplama...")
+    interval_req = calculate_interval_requirements(df)
     
-    print(f"  A agentları: {a_ind_final} (sadece A çağrılarını karşılar)")
-    print(f"  B agentları: {b_ind_final} (sadece B çağrılarını karşılar)")
-    print(f"  TOPLAM: {total_ind}")
+    print(f"✅ {len(interval_req)} interval hesaplandı")
+    print(f"   Peak: {interval_req['total_agents'].max()} agent")
+    print(f"   Peak Saat: {interval_req.loc[interval_req['total_agents'].idxmax(), 'time']}")
     
-    # YARDIMLAŞMALI
-    print("\n─" * 60)
-    print("YÖNTEM 2: YARDIMLAŞMALI")
-    print("─" * 60)
+    # ADIM 2: Vardiya bazlı
+    print("\n⚙️ ADIM 2: Vardiya bazlı hesaplama...")
+    shift_req = calculate_shift_requirements(interval_req, ALL_SHIFTS)
     
-    result = calculate_with_support_single(calls_a, calls_b)
+    # Sıfır agentli vardiyaları filtrele
+    shift_req_active = shift_req[shift_req['total'] > 0]
     
-    print(f"  A agentları: {result['agents_a']} (sadece A)")
-    print(f"  B agentları: {result['agents_b']} (B + boşsa A'ya yardım)")
-    print(f"  TOPLAM: {result['total']}")
-    print(f"  B yardım etti mi? {'✅ Evet' if result['b_helps_a'] else '❌ Hayır'}")
+    print(f"✅ {len(shift_req_active)} aktif vardiya bulundu")
+    print(f"   (Toplam 19 vardiyadan {len(shift_req) - len(shift_req_active)} boş)")
     
-    # FARK
-    print("\n─" * 60)
-    print("💰 TASARRUF")
-    print("─" * 60)
-    
-    diff = total_ind - result['total']
-    pct = (diff / total_ind * 100) if total_ind > 0 else 0
-    
-    print(f"  Fark: {diff} agent ({pct:.1f}%)")
-    
-    if diff > 0:
-        print(f"  ✅ {diff} agent tasarruf!")
-    elif diff == 0:
-        print(f"  ⚠️ Fark yok (B çağrıları çok fazla)")
-    else:
-        print(f"  ❌ Hata var!")
-    
-    return {
-        'independent': total_ind,
-        'support': result['total'],
-        'saving': diff
-    }
+    return interval_req, shift_req, shift_req_active
 
 
 # ============= TEST =============
 
 if __name__ == '__main__':
     
-    # Test 1: B çağrıları az
-    print("\n" + "=" * 60)
-    print("TEST 1: B ÇAĞRILARI AZ")
-    print("=" * 60)
-    compare_methods_single(calls_a=50, calls_b=10)
+    # Örnek veri (24 saat, 30dk interval = 48 satır)
+    times = pd.date_range('00:00', '23:30', freq='30min').strftime('%H:%M')
     
-    # Test 2: B çağrıları orta
-    print("\n\n" + "=" * 60)
-    print("TEST 2: B ÇAĞRILARI ORTA")
-    print("=" * 60)
-    compare_methods_single(calls_a=50, calls_b=30)
+    # Gerçekçi pattern
+    sample_data = pd.DataFrame({
+        'time': times,
+        'queue_a': [
+            # 00:00-06:00 (Gece - az)
+            5,5,5,5,5,5,8,8,10,10,12,12,
+            # 06:00-12:00 (Sabah - artıyor)
+            20,25,30,40,50,55,60,60,58,56,54,52,
+            # 12:00-18:00 (Öğle-Akşam - yüksek)
+            50,48,46,44,50,55,60,58,56,54,52,50,
+            # 18:00-24:00 (Gece - azalıyor)
+            45,40,35,30,25,20,15,12,10,8,6,5
+        ],
+        'queue_b': [
+            # 00:00-06:00
+            3,3,3,3,3,3,5,5,6,6,8,8,
+            # 06:00-12:00
+            10,12,15,20,25,28,30,30,29,28,27,26,
+            # 12:00-18:00
+            25,24,23,22,25,28,30,29,28,27,26,25,
+            # 18:00-24:00
+            22,20,18,15,12,10,8,6,5,4,3,3
+        ]
+    })
     
-    # Test 3: B çağrıları çok
-    print("\n\n" + "=" * 60)
-    print("TEST 3: B ÇAĞRILARI ÇOK")
-    print("=" * 60)
-    compare_methods_single(calls_a=30, calls_b=50)
+    # Hesapla
+    interval_req, shift_req_all, shift_req_active = calculate_all(sample_data)
     
-    print("\n\n" + "=" * 60)
-    print("💡 SONUÇ:")
-    print("=" * 60)
-    print("B çağrıları az → B agentları A'ya yardım eder → Tasarruf!")
-    print("B çağrıları çok → B agentları sadece B'yi karşılar → Tasarruf yok")
-    print("\n➡️ Sonraki: DataFrame ile tüm gün hesaplama")
+    # Sonuçları göster
+    print("\n" + "=" * 70)
+    print("📊 VARDİYA SONUÇLARI (Aktif Vardiyalar)")
+    print("=" * 70)
+    print(shift_req_active.to_string(index=False))
+    
+    # A21 vs B21 ayrımı
+    print("\n" + "=" * 70)
+    print("📊 FİRMA BAZLI DAĞILIM")
+    print("=" * 70)
+    
+    a21_shifts = shift_req_active[shift_req_active['shift'].isin([s['name'] for s in SHIFTS_A21])]
+    b21_shifts = shift_req_active[shift_req_active['shift'].isin([s['name'] for s in SHIFTS_B21])]
+    
+    print(f"\n🏢 A21 Firma Vardiyaları: {len(a21_shifts)} aktif")
+    print(f"   Toplam Agent: {a21_shifts['total'].sum()}")
+    
+    print(f"\n🏢 B21 Firma Vardiyaları: {len(b21_shifts)} aktif")
+    print(f"   Toplam Agent: {b21_shifts['total'].sum()}")
+    
+    print("\n" + "=" * 70)
+    print("✅ AŞAMA 1 TAMAMLANDI")
+    print("=" * 70)
+    print("Sonraki adımlar:")
+    print("  1. Mola planlaması")
+    print("  2. Firma kırılımı (A21 %30 B-capable)")
+    print("  3. Yardımlaşma mantığı")
