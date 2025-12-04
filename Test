@@ -1,5 +1,5 @@
 “””
-19 Vardiya ile Kapasite Planlama - Date kolonu eklendi
+19 Vardiya ile Kapasite Planlama - Date kolonu + 15dk interval
 “””
 import pandas as pd
 import math
@@ -85,7 +85,7 @@ ALL_SHIFTS = SHIFTS_A21 + SHIFTS_B21
 
 # ============= INTERVAL BAZLI İHTİYAÇ =============
 
-def calculate_interval_requirements(df, interval_min=30, aht=180,
+def calculate_interval_requirements(df, interval_min=15, aht=180,
 target_asa=30, shrinkage=0.10):
 “””
 Her interval için agent ihtiyacı (BAĞIMSIZ)
@@ -126,60 +126,79 @@ for idx, row in df.iterrows():
 return pd.DataFrame(results)
 ```
 
-# ============= VARDİYA BAZLI İHTİYAÇ =============
+# ============= VARDİYA BAZLI İHTİYAÇ (GÜNLÜK) =============
 
 def calculate_shift_requirements(interval_df, shifts):
-“”“Vardiya bazlı agent ihtiyacı”””
+“””
+Vardiya bazlı agent ihtiyacı - GÜNLÜK
+Her tarih için ayrı hesapla
+“””
 shift_results = []
 
 ```
-for shift in shifts:
-    shift_intervals = interval_df[
-        interval_df['time'].apply(
-            lambda t: is_time_in_shift(t, shift['start'], shift['end'])
-        )
-    ]
+# Her tarih için
+for date in interval_df['date'].unique():
+    date_intervals = interval_df[interval_df['date'] == date]
     
-    if len(shift_intervals) == 0:
-        agents_a = 0
-        agents_b = 0
-        max_total = 0
-    else:
-        agents_a = shift_intervals['agents_a'].max()
-        agents_b = shift_intervals['agents_b'].max()
-        max_total = shift_intervals['total_agents'].max()
-    
-    shift_results.append({
-        'shift': shift['name'],
-        'start': shift['start'],
-        'end': shift['end'],
-        'duration': shift['duration'],
-        'agents_a': int(agents_a),
-        'agents_b': int(agents_b),
-        'total': int(max_total),
-        'intervals': len(shift_intervals)
-    })
+    # Her vardiya için
+    for shift in shifts:
+        shift_intervals = date_intervals[
+            date_intervals['time'].apply(
+                lambda t: is_time_in_shift(t, shift['start'], shift['end'])
+            )
+        ]
+        
+        if len(shift_intervals) == 0:
+            agents_a = 0
+            agents_b = 0
+            max_total = 0
+        else:
+            agents_a = shift_intervals['agents_a'].max()
+            agents_b = shift_intervals['agents_b'].max()
+            max_total = shift_intervals['total_agents'].max()
+        
+        shift_results.append({
+            'date': date,  # ← DATE EKLENDİ
+            'shift': shift['name'],
+            'start': shift['start'],
+            'end': shift['end'],
+            'duration': shift['duration'],
+            'agents_a': int(agents_a),
+            'agents_b': int(agents_b),
+            'total': int(max_total),
+            'intervals': len(shift_intervals)
+        })
 
 return pd.DataFrame(shift_results)
 ```
 
 # ============= ANA FONKSİYON =============
 
-def calculate_all(df):
-“”“Tüm hesaplama - Interval ve Vardiya”””
+def calculate_all(df, interval_min=15):
+“””
+Tüm hesaplama - Interval ve Vardiya
 
 ```
+interval_min: 15 veya 30 (dakika)
+"""
+
 print("=" * 70)
 print("KAPASİTE PLANLAMA - 19 VARDİYA")
 print("=" * 70)
 
+print(f"\n📋 Ayarlar:")
+print(f"   İnterval: {interval_min} dakika")
+print(f"   AHT: 180 saniye")
+print(f"   Hedef ASA: 30 saniye")
+print(f"   Shrinkage: %10")
+
 # ADIM 1: Interval bazlı
 print("\n⚙️ ADIM 1: Interval bazlı hesaplama...")
-interval_req = calculate_interval_requirements(df)
+interval_req = calculate_interval_requirements(df, interval_min=interval_min)
 
 print(f"✅ {len(interval_req)} interval hesaplandı")
+print(f"   Tarih sayısı: {interval_req['date'].nunique()}")
 print(f"   Peak: {interval_req['total_agents'].max()} agent")
-print(f"   Peak Saat: {interval_req.loc[interval_req['total_agents'].idxmax(), 'time']}")
 
 # ADIM 2: Vardiya bazlı
 print("\n⚙️ ADIM 2: Vardiya bazlı hesaplama...")
@@ -188,62 +207,109 @@ shift_req = calculate_shift_requirements(interval_req, ALL_SHIFTS)
 # Sıfır agentli vardiyaları filtrele
 shift_req_active = shift_req[shift_req['total'] > 0]
 
-print(f"✅ {len(shift_req_active)} aktif vardiya bulundu")
-print(f"   (Toplam 19 vardiyadan {len(shift_req) - len(shift_req_active)} boş)")
+print(f"✅ {len(shift_req_active)} aktif vardiya-gün kombinasyonu")
+print(f"   (Toplam {len(shift_req)} olasılıktan)")
 
 return interval_req, shift_req, shift_req_active
 ```
 
-# ============= TEST =============
+# ============= KENDİ VERİNLE ÇALIŞMA =============
+
+def run_with_my_data(excel_path):
+“””
+Kendi Excel dosyanla çalıştır
+
+```
+Excel formatı:
+- date: '2025-01-01' veya datetime
+- time: '07:00' 
+- queue_a: çağrı sayısı
+- queue_b: çağrı sayısı
+"""
+
+print("📂 Excel dosyası okunuyor...")
+df = pd.read_excel(excel_path)
+
+# Kolon kontrolü
+required_cols = ['date', 'time', 'queue_a', 'queue_b']
+missing = [col for col in required_cols if col not in df.columns]
+
+if missing:
+    print(f"❌ HATA: Eksik kolonlar: {missing}")
+    return None
+
+print(f"✅ {len(df)} satır veri okundu")
+print(f"   Tarih aralığı: {df['date'].min()} - {df['date'].max()}")
+
+# Hesapla (15 dakika interval)
+interval_req, shift_req_all, shift_req_active = calculate_all(df, interval_min=15)
+
+# Kaydet
+print("\n💾 Sonuçlar kaydediliyor...")
+interval_req.to_excel('interval_sonuclari.xlsx', index=False)
+shift_req_active.to_excel('vardiya_sonuclari.xlsx', index=False)
+
+print("✅ Kaydedildi:")
+print("   - interval_sonuclari.xlsx")
+print("   - vardiya_sonuclari.xlsx")
+
+return interval_req, shift_req_all, shift_req_active
+```
+
+# ============= KULLANIM ÖRNEĞİ =============
 
 if **name** == ‘**main**’:
 
 ```
-# Örnek veri (24 saat, 30dk interval = 48 satır)
-times = pd.date_range('00:00', '23:30', freq='30min').strftime('%H:%M')
-
-# Tek gün örnek
-sample_data = pd.DataFrame({
-    'date': '2025-01-15',  # ← DATE KOLONU EKLENDİ
-    'time': times,
-    'queue_a': [
-        # 00:00-06:00 (Gece - az)
-        5,5,5,5,5,5,8,8,10,10,12,12,
-        # 06:00-12:00 (Sabah - artıyor)
-        20,25,30,40,50,55,60,60,58,56,54,52,
-        # 12:00-18:00 (Öğle-Akşam - yüksek)
-        50,48,46,44,50,55,60,58,56,54,52,50,
-        # 18:00-24:00 (Gece - azalıyor)
-        45,40,35,30,25,20,15,12,10,8,6,5
-    ],
-    'queue_b': [
-        # 00:00-06:00
-        3,3,3,3,3,3,5,5,6,6,8,8,
-        # 06:00-12:00
-        10,12,15,20,25,28,30,30,29,28,27,26,
-        # 12:00-18:00
-        25,24,23,22,25,28,30,29,28,27,26,25,
-        # 18:00-24:00
-        22,20,18,15,12,10,8,6,5,4,3,3
-    ]
-})
-
-# Hesapla
-interval_req, shift_req_all, shift_req_active = calculate_all(sample_data)
-
-# Sonuçları göster
 print("\n" + "=" * 70)
-print("📊 VARDİYA SONUÇLARI (Aktif Vardiyalar)")
+print("KENDİ VERİNLE ÇALIŞTIRMA TALİMATI")
 print("=" * 70)
-print(shift_req_active.to_string(index=False))
-
-# Interval sonuçları (ilk 10)
-print("\n" + "=" * 70)
-print("📊 INTERVAL SONUÇLARI (İlk 10 satır)")
-print("=" * 70)
-print(interval_req[['date', 'time', 'calls_a', 'calls_b', 'agents_a', 'agents_b', 'total_agents']].head(10).to_string(index=False))
-
-print("\n" + "=" * 70)
-print("✅ HESAPLAMA TAMAMLANDI")
-print("=" * 70)
+print("""
 ```
+
+1. Excel dosyan şu kolonlara sahip olmalı:
+- date: ‘2025-01-01’ formatında
+- time: ‘07:00’, ‘07:15’, ‘07:30’ formatında (15 dk interval)
+- queue_a: A kuyruğu çağrı sayısı
+- queue_b: B kuyruğu çağrı sayısı
+1. Çalıştırma:
+   
+   # Yöntem 1: Fonksiyon ile
+   
+   result = run_with_my_data(‘cagri_tahminleri.xlsx’)
+   
+   # Yöntem 2: Manuel
+   
+   df = pd.read_excel(‘cagri_tahminleri.xlsx’)
+   interval_req, shift_req_all, shift_req_active = calculate_all(df, interval_min=15)
+   shift_req_active.to_excel(‘sonuc.xlsx’, index=False)
+1. Çıktı:
+- interval_sonuclari.xlsx: Her interval için agent sayısı
+- vardiya_sonuclari.xlsx: Her gün her vardiya için agent sayısı
+  “””)
+   
+   print(”\n” + “=” * 70)
+   print(“TEST VERİSİ İLE ÖRNEK”)
+   print(”=” * 70)
+   
+   # Test verisi (2 gün, 15dk interval)
+   
+   times_15min = pd.date_range(‘00:00’, ‘23:45’, freq=‘15min’).strftime(’%H:%M’)
+   
+   test_data = pd.DataFrame({
+   ‘date’: [‘2025-01-15’] * len(times_15min) + [‘2025-01-16’] * len(times_15min),
+   ‘time’: list(times_15min) + list(times_15min),
+   ‘queue_a’: [10, 12, 15, 18] * 24,  # Basit pattern
+   ‘queue_b’: [5, 6, 8, 10] * 24
+   })
+   
+   # Hesapla
+   
+   interval_req, shift_req_all, shift_req_active = calculate_all(test_data, interval_min=15)
+   
+   # Sonuçları göster
+   
+   print(”\n📊 VARDİYA SONUÇLARI (İlk 10 satır):”)
+   print(shift_req_active[[‘date’, ‘shift’, ‘start’, ‘end’, ‘agents_a’, ‘agents_b’, ‘total’]].head(10).to_string(index=False))
+   
+   print(”\n✅ Test tamamlandı! Şimdi kendi verinle çalıştırabilirsin.”)
