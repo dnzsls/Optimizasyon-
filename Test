@@ -1,68 +1,164 @@
 “””
-Vardiya Kesişim Bazlı Agent Dağıtımı
-Az kesişen vardiyaya daha az, çok kesişene daha az agent
-“””
-import pandas as pd
-import math
+KOMPLE KAPASİTE PLANLAMA
+
+1. Interval bazlı agent ihtiyacı (Erlang C)
+1. Vardiyalara kesişim bazlı dağıtım
+   “””
+   import pandas as pd
+   import math
+
+# ============= KONFIGURASYON =============
+
+CONFIG = {
+‘aht’: 180,              # Average Handle Time - saniye
+‘target_asa’: 30,        # Hedef yanıt süresi - saniye
+‘shrinkage’: 0.10,       # Mola/izin payı - %10
+‘interval_minutes’: 15   # İnterval - dakika
+}
 
 # ============= VARDİYA TANIMLARI =============
 
 SHIFTS_A21 = [
-{‘name’: ‘V1’, ‘start’: ‘07:00’, ‘end’: ‘16:00’, ‘duration’: 9.0},
-{‘name’: ‘V2’, ‘start’: ‘08:00’, ‘end’: ‘17:00’, ‘duration’: 9.0},
-{‘name’: ‘V3’, ‘start’: ‘09:00’, ‘end’: ‘18:00’, ‘duration’: 9.0},
-{‘name’: ‘V4’, ‘start’: ‘10:00’, ‘end’: ‘19:00’, ‘duration’: 9.0},
-{‘name’: ‘V5’, ‘start’: ‘15:00’, ‘end’: ‘24:00’, ‘duration’: 9.0},
-{‘name’: ‘V6’, ‘start’: ‘17:00’, ‘end’: ‘01:00’, ‘duration’: 8.0},
-{‘name’: ‘V7’, ‘start’: ‘18:00’, ‘end’: ‘02:00’, ‘duration’: 8.0},
-{‘name’: ‘V8’, ‘start’: ‘19:00’, ‘end’: ‘03:00’, ‘duration’: 8.0},
-{‘name’: ‘V9’, ‘start’: ‘00:00’, ‘end’: ‘08:00’, ‘duration’: 8.0},
+{‘name’: ‘V1’, ‘start’: ‘07:00’, ‘end’: ‘16:00’},
+{‘name’: ‘V2’, ‘start’: ‘08:00’, ‘end’: ‘17:00’},
+{‘name’: ‘V3’, ‘start’: ‘09:00’, ‘end’: ‘18:00’},
+{‘name’: ‘V4’, ‘start’: ‘10:00’, ‘end’: ‘19:00’},
+{‘name’: ‘V5’, ‘start’: ‘15:00’, ‘end’: ‘24:00’},
+{‘name’: ‘V6’, ‘start’: ‘17:00’, ‘end’: ‘01:00’},
+{‘name’: ‘V7’, ‘start’: ‘18:00’, ‘end’: ‘02:00’},
+{‘name’: ‘V8’, ‘start’: ‘19:00’, ‘end’: ‘03:00’},
+{‘name’: ‘V9’, ‘start’: ‘00:00’, ‘end’: ‘08:00’},
 ]
 
 SHIFTS_B21 = [
-{‘name’: ‘V10’, ‘start’: ‘08:00’, ‘end’: ‘17:30’, ‘duration’: 9.5},
-{‘name’: ‘V11’, ‘start’: ‘09:00’, ‘end’: ‘18:30’, ‘duration’: 9.5},
-{‘name’: ‘V12’, ‘start’: ‘10:00’, ‘end’: ‘19:30’, ‘duration’: 9.5},
-{‘name’: ‘V13’, ‘start’: ‘11:00’, ‘end’: ‘20:30’, ‘duration’: 9.5},
-{‘name’: ‘V14’, ‘start’: ‘12:00’, ‘end’: ‘21:30’, ‘duration’: 9.5},
-{‘name’: ‘V15’, ‘start’: ‘13:00’, ‘end’: ‘22:30’, ‘duration’: 9.5},
-{‘name’: ‘V16’, ‘start’: ‘14:00’, ‘end’: ‘23:30’, ‘duration’: 9.5},
-{‘name’: ‘V17’, ‘start’: ‘15:00’, ‘end’: ‘00:30’, ‘duration’: 9.5},
-{‘name’: ‘V18’, ‘start’: ‘17:00’, ‘end’: ‘01:30’, ‘duration’: 8.5},
-{‘name’: ‘V19’, ‘start’: ‘18:00’, ‘end’: ‘02:30’, ‘duration’: 8.5},
+{‘name’: ‘V10’, ‘start’: ‘08:00’, ‘end’: ‘17:30’},
+{‘name’: ‘V11’, ‘start’: ‘09:00’, ‘end’: ‘18:30’},
+{‘name’: ‘V12’, ‘start’: ‘10:00’, ‘end’: ‘19:30’},
+{‘name’: ‘V13’, ‘start’: ‘11:00’, ‘end’: ‘20:30’},
+{‘name’: ‘V14’, ‘start’: ‘12:00’, ‘end’: ‘21:30’},
+{‘name’: ‘V15’, ‘start’: ‘13:00’, ‘end’: ‘22:30’},
+{‘name’: ‘V16’, ‘start’: ‘14:00’, ‘end’: ‘23:30’},
+{‘name’: ‘V17’, ‘start’: ‘15:00’, ‘end’: ‘00:30’},
+{‘name’: ‘V18’, ‘start’: ‘17:00’, ‘end’: ‘01:30’},
+{‘name’: ‘V19’, ‘start’: ‘18:00’, ‘end’: ‘02:30’},
 ]
 
 ALL_SHIFTS = SHIFTS_A21 + SHIFTS_B21
 
-# ============= YARDIMCI FONKSİYONLAR =============
+# ============================================================================
+
+# BÖLÜM 1: INTERVAL BAZLI AGENT İHTİYACI (ERLANG C)
+
+# ============================================================================
+
+def erlang_c(agents, traffic):
+if agents <= traffic or agents == 0:
+return 1.0
+erlang_b = traffic / agents
+for i in range(2, int(agents) + 1):
+erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
+erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
+return min(erlang_c_val, 1.0)
+
+def calculate_asa(agents, traffic, aht):
+if agents <= traffic:
+return 999
+ec = erlang_c(agents, traffic)
+asa = (ec * (aht / 60)) / (agents - traffic) * 60
+return asa
+
+def find_agents_for_target(calls, interval_min, aht, target_asa):
+if calls == 0:
+return 0
+traffic = (calls * (aht / 60)) / interval_min
+if traffic == 0:
+return 0
+min_agents = math.ceil(traffic)
+max_agents = math.ceil(traffic * 2) + 5
+for agents in range(min_agents, max_agents + 1):
+asa = calculate_asa(agents, traffic, aht)
+if asa <= target_asa:
+return agents
+return max_agents
+
+def calculate_interval_requirements(df):
+“””
+BÖLÜM 1: Her interval için agent ihtiyacını hesapla
+
+```
+Giriş: date, time, queue_a, queue_b
+Çıkış: date, time, calls_a, calls_b, agents_a, agents_b, total_agents
+"""
+results = []
+
+for idx, row in df.iterrows():
+    date = row['date']
+    time = row['time']
+    
+    # Time object ise string'e çevir
+    if hasattr(time, 'strftime'):
+        time = time.strftime('%H:%M')
+    elif not isinstance(time, str):
+        time = str(time)
+    
+    calls_a = row['queue_a']
+    calls_b = row['queue_b']
+    
+    # A için
+    agents_a_raw = find_agents_for_target(
+        calls_a, CONFIG['interval_minutes'], 
+        CONFIG['aht'], CONFIG['target_asa']
+    )
+    agents_a_final = math.ceil(agents_a_raw / (1 - CONFIG['shrinkage']))
+    
+    # B için
+    agents_b_raw = find_agents_for_target(
+        calls_b, CONFIG['interval_minutes'],
+        CONFIG['aht'], CONFIG['target_asa']
+    )
+    agents_b_final = math.ceil(agents_b_raw / (1 - CONFIG['shrinkage']))
+    
+    results.append({
+        'date': date,
+        'time': time,
+        'calls_a': calls_a,
+        'calls_b': calls_b,
+        'agents_a': agents_a_final,
+        'agents_b': agents_b_final,
+        'total_agents': agents_a_final + agents_b_final
+    })
+
+return pd.DataFrame(results)
+```
+
+# ============================================================================
+
+# BÖLÜM 2: VARDİYALARA KESİŞİM BAZLI DAĞITIM
+
+# ============================================================================
 
 def time_to_minutes(time_str):
-“””‘07:30’ → 450 dakika”””
-h, m = map(int, time_str.split(’:’))
+if hasattr(time_str, ‘strftime’):
+time_str = time_str.strftime(’%H:%M’)
+h, m = map(int, str(time_str).split(’:’))
 return h * 60 + m
 
 def shifts_overlap(shift1, shift2):
-“”“İki vardiya kesişiyor mu?”””
 s1_start = time_to_minutes(shift1[‘start’])
 s1_end = time_to_minutes(shift1[‘end’])
 s2_start = time_to_minutes(shift2[‘start’])
 s2_end = time_to_minutes(shift2[‘end’])
 
 ```
-# Gece vardiyası kontrolü
 if s1_end <= s1_start:
     s1_end += 24 * 60
 if s2_end <= s2_start:
     s2_end += 24 * 60
 
-# Normalize et (0-1440 aralığına)
-# Kesişim kontrolü
-return not (s1_end <= s2_start or s2_end <= s1_start or 
-            (s1_end - 24*60) <= s2_start or s2_end <= (s1_start + 24*60))
+return s1_start < s2_end and s2_start < s1_end
 ```
 
 def calculate_overlap_count(shift, all_shifts):
-“”“Bir vardiya kaç vardiya ile kesişiyor?”””
 count = 0
 for other_shift in all_shifts:
 if shift[‘name’] != other_shift[‘name’]:
@@ -71,106 +167,82 @@ count += 1
 return count
 
 def is_time_in_shift(time_str, shift_start, shift_end):
-“”“Bir zaman vardiya içinde mi?”””
 time_min = time_to_minutes(time_str)
 start_min = time_to_minutes(shift_start)
 end_min = time_to_minutes(shift_end)
 
 ```
-if end_min <= start_min:  # Gece vardiyası
+if end_min <= start_min:
     return time_min >= start_min or time_min < end_min
 else:
     return start_min <= time_min < end_min
 ```
 
-# ============= KESİŞİM BAZLI DAĞITIM =============
-
-def distribute_agents_by_overlap(interval_df, shifts):
+def distribute_by_overlap(interval_df):
 “””
-Kesişim sayısına göre agent dağıtımı
+BÖLÜM 2: Kesişim bazlı dağıtım
+“””
+# Kesişim sayıları
+shift_overlaps = {}
+for shift in ALL_SHIFTS:
+overlap_count = calculate_overlap_count(shift, ALL_SHIFTS)
+shift_overlaps[shift[‘name’]] = {
+‘shift’: shift,
+‘overlap_count’: overlap_count
+}
 
 ```
-Mantık:
-1. Her vardiya için kesişim sayısını hesapla
-2. Her interval için o anda çalışan vardiyaları bul
-3. İhtiyacı kesişim oranına göre dağıt (az kesişen → daha çok agent)
-"""
-
-# ADIM 1: Her vardiya için kesişim sayısını hesapla
-print("\n⚙️ ADIM 1: Vardiya kesişim sayıları hesaplanıyor...")
-
-shift_overlaps = {}
-for shift in shifts:
-    overlap_count = calculate_overlap_count(shift, shifts)
-    shift_overlaps[shift['name']] = {
-        'shift': shift,
-        'overlap_count': overlap_count
-    }
-    print(f"   {shift['name']}: {overlap_count} vardiya ile kesişiyor")
-
-# ADIM 2: Her interval için dağıtım yap
-print("\n⚙️ ADIM 2: Interval bazlı dağıtım yapılıyor...")
-
 results = []
 
-for date in sorted(interval_df['date'].unique()):
-    date_intervals = interval_df[interval_df['date'] == date]
+for idx, row in interval_df.iterrows():
+    date = row['date']
+    time = row['time']
+    total_needed = row['total_agents']
     
-    # Her interval için
-    for idx, row in date_intervals.iterrows():
-        time = row['time']
-        total_needed = row['total_agents']
-        
-        if total_needed == 0:
-            continue
-        
-        # Bu saatte çalışan vardiyaları bul
-        working_shifts = []
-        for shift_name, info in shift_overlaps.items():
-            shift = info['shift']
-            if is_time_in_shift(time, shift['start'], shift['end']):
-                working_shifts.append({
-                    'name': shift_name,
-                    'overlap_count': info['overlap_count']
-                })
-        
-        if len(working_shifts) == 0:
-            continue
-        
-        # Kesişim oranına göre dağıt
-        # Az kesişen → Daha fazla agent
-        # Ters oran kullan: 1 / overlap_count
-        total_weight = sum(1 / (ws['overlap_count'] + 1) for ws in working_shifts)
-        
-        for ws in working_shifts:
-            weight = 1 / (ws['overlap_count'] + 1)
-            ratio = weight / total_weight
-            agents_needed = total_needed * ratio
-            
-            results.append({
-                'date': date,
-                'time': time,
-                'shift': ws['name'],
-                'agents_needed': agents_needed,
-                'overlap_count': ws['overlap_count']
+    if total_needed == 0:
+        continue
+    
+    # Bu saatte çalışan vardiyalar
+    working_shifts = []
+    for shift_name, info in shift_overlaps.items():
+        shift = info['shift']
+        if is_time_in_shift(time, shift['start'], shift['end']):
+            working_shifts.append({
+                'name': shift_name,
+                'overlap_count': info['overlap_count']
             })
+    
+    if len(working_shifts) == 0:
+        continue
+    
+    # Kesişim oranına göre dağıt
+    total_weight = sum(1 / (ws['overlap_count'] + 1) for ws in working_shifts)
+    
+    for ws in working_shifts:
+        weight = 1 / (ws['overlap_count'] + 1)
+        ratio = weight / total_weight
+        agents_needed = total_needed * ratio
+        
+        results.append({
+            'date': date,
+            'time': time,
+            'shift': ws['name'],
+            'agents_needed': agents_needed,
+            'overlap_count': ws['overlap_count']
+        })
 
 return pd.DataFrame(results)
 ```
 
-def aggregate_shift_requirements(distribution_df, shifts):
-“””
-Her vardiya için toplam agent ihtiyacını hesapla
-Her gün için her vardiyada MAX agent sayısı
-“””
-
-```
+def aggregate_shifts(distribution_df):
+“”“Her vardiya için MAX agent sayısı”””
 shift_results = []
 
+```
 for date in sorted(distribution_df['date'].unique()):
     date_data = distribution_df[distribution_df['date'] == date]
     
-    for shift in shifts:
+    for shift in ALL_SHIFTS:
         shift_data = date_data[date_data['shift'] == shift['name']]
         
         if len(shift_data) > 0:
@@ -178,53 +250,142 @@ for date in sorted(distribution_df['date'].unique()):
         else:
             max_agents = 0
         
-        shift_results.append({
-            'date': date,
-            'shift': shift['name'],
-            'start': shift['start'],
-            'end': shift['end'],
-            'duration': shift['duration'],
-            'agents': max_agents
-        })
+        if max_agents > 0:
+            shift_results.append({
+                'date': date,
+                'shift': shift['name'],
+                'start': shift['start'],
+                'end': shift['end'],
+                'agents': max_agents
+            })
 
 return pd.DataFrame(shift_results)
 ```
 
-# ============= TEST =============
+def verify_coverage(interval_df, vardiya_df):
+“”“Doğrulama: Vardiyalardan gelen agent toplamı yeterli mi?”””
+verify_results = []
+
+```
+for idx, row in interval_df.iterrows():
+    date = row['date']
+    time = row['time']
+    needed = row['total_agents']
+    
+    if needed == 0:
+        continue
+    
+    # Bu tarih için vardiyalar
+    date_shifts = vardiya_df[vardiya_df['date'] == date]
+    
+    # Bu saatte çalışan vardiyaların toplam agentı
+    total_available = 0
+    for _, shift_row in date_shifts.iterrows():
+        if is_time_in_shift(time, shift_row['start'], shift_row['end']):
+            total_available += shift_row['agents']
+    
+    verify_results.append({
+        'date': date,
+        'time': time,
+        'needed': needed,
+        'available': total_available,
+        'sufficient': total_available >= needed,
+        'diff': total_available - needed
+    })
+
+return pd.DataFrame(verify_results)
+```
+
+# ============================================================================
+
+# ANA FONKSİYON
+
+# ============================================================================
+
+def calculate_complete_planning(df):
+“””
+Komple kapasite planlaması
+
+```
+Giriş: date, time, queue_a, queue_b
+Çıkış: interval_df, vardiya_df, verify_df
+"""
+
+print("=" * 70)
+print("KOMPLE KAPASİTE PLANLAMA")
+print("=" * 70)
+
+# BÖLÜM 1: Interval bazlı ihtiyaç
+print("\n⚙️ BÖLÜM 1: Interval bazlı agent ihtiyacı hesaplanıyor...")
+interval_df = calculate_interval_requirements(df)
+print(f"✅ {len(interval_df)} interval hesaplandı")
+print(f"   Peak: {interval_df['total_agents'].max()} agent")
+
+# BÖLÜM 2: Vardiyalara dağıt
+print("\n⚙️ BÖLÜM 2: Vardiyalara kesişim bazlı dağıtım yapılıyor...")
+distribution_df = distribute_by_overlap(interval_df)
+
+print("\n⚙️ BÖLÜM 3: Vardiya bazlı toplama yapılıyor...")
+vardiya_df = aggregate_shifts(distribution_df)
+print(f"✅ {len(vardiya_df)} vardiya-gün kombinasyonu")
+
+# BÖLÜM 3: Doğrulama
+print("\n⚙️ BÖLÜM 4: Doğrulama yapılıyor...")
+verify_df = verify_coverage(interval_df, vardiya_df)
+
+sufficient_count = verify_df['sufficient'].sum()
+total_count = len(verify_df)
+
+print(f"✅ {sufficient_count} / {total_count} interval yeterli")
+
+insufficient = verify_df[~verify_df['sufficient']]
+if len(insufficient) > 0:
+    print(f"⚠️ {len(insufficient)} interval YETERSİZ!")
+    print("\nYetersiz intervaller:")
+    print(insufficient[['date', 'time', 'needed', 'available', 'diff']].head(10))
+
+print("\n" + "=" * 70)
+print("✅ TAMAMLANDI!")
+print("=" * 70)
+
+return interval_df, vardiya_df, verify_df
+```
+
+# ============================================================================
+
+# KULLANIM
+
+# ============================================================================
 
 if **name** == ‘**main**’:
 
 ```
-# Test verisi: Basit bir gün
-test_intervals = pd.DataFrame({
-    'date': '2025-01-15',
-    'time': ['07:00', '08:00', '09:00', '10:00', '15:00', '18:00', '00:00'],
-    'total_agents': [50, 80, 135, 120, 90, 60, 20]
-})
-
-print("=" * 70)
-print("VARDİYA KESİŞİM BAZLI DAĞITIM")
-print("=" * 70)
-
-# Dağıtım yap
-distribution = distribute_agents_by_overlap(test_intervals, ALL_SHIFTS)
-
-print("\n" + "=" * 70)
-print("📊 DAĞITIM SONUÇLARI (09:00 örneği)")
-print("=" * 70)
-
-sample = distribution[(distribution['time'] == '09:00')]
-print(sample[['shift', 'agents_needed', 'overlap_count']].to_string(index=False))
-print(f"\nToplam: {sample['agents_needed'].sum():.1f} (Hedef: 135)")
-
-# Vardiya bazlı toplam
-shift_req = aggregate_shift_requirements(distribution, ALL_SHIFTS)
-shift_req_active = shift_req[shift_req['agents'] > 0]
-
-print("\n" + "=" * 70)
-print("📊 VARDİYA BAZLI SONUÇLAR")
-print("=" * 70)
-print(shift_req_active[['shift', 'start', 'end', 'agents']].to_string(index=False))
-
-print("\n✅ Kesişim bazlı dağıtım tamamlandı!")
+print("""
 ```
+
+╔══════════════════════════════════════════════════════════════════╗
+║  KOMPLE KAPASİTE PLANLAMA SİSTEMİ                                ║
+╚══════════════════════════════════════════════════════════════════╝
+
+KULLANIM:
+
+# Excel’den oku
+
+df = pd.read_excel(‘cagri_tahminleri.xlsx’)
+
+# Kolonlar: date, time, queue_a, queue_b
+
+# Hesapla
+
+interval_df, vardiya_df, verify_df = calculate_complete_planning(df)
+
+# Kaydet
+
+interval_df.to_excel(‘1_interval_sonuclari.xlsx’, index=False)
+vardiya_df.to_excel(‘2_vardiya_plani.xlsx’, index=False)
+verify_df.to_excel(‘3_dogrulama.xlsx’, index=False)
+
+# Yetersiz intervalleri kontrol et
+
+print(verify_df[~verify_df[‘sufficient’]])
+“””)
