@@ -16,12 +16,12 @@ CONFIG = {
 
 
 # ============================================================================
-# VARDİYA OKUMA (EXCEL'DEN)
+# VARDİYA OKUMA (EXCEL'DEN) - ZORUNLU
 # ============================================================================
 
 def load_shifts_from_excel(excel_path):
     """
-    Excel'den vardiya tanımlarını oku
+    Excel'den vardiya tanımlarını oku - ZORUNLU
     
     Excel formatı:
     - shift: Vardiya adı (V1, V2, ...)
@@ -33,6 +33,7 @@ def load_shifts_from_excel(excel_path):
     shift  | start | end   | company
     V1     | 07:00 | 16:00 | A21
     V2     | 08:00 | 17:00 | A21
+    V2     | 08:00 | 17:00 | B21  ← Aynı vardiya, farklı firma
     """
     df = pd.read_excel(excel_path)
     
@@ -40,7 +41,7 @@ def load_shifts_from_excel(excel_path):
     required = ['shift', 'start', 'end']
     missing = [col for col in required if col not in df.columns]
     if missing:
-        raise ValueError(f"Eksik kolonlar: {missing}")
+        raise ValueError(f"❌ Eksik kolonlar: {missing}")
     
     shifts = []
     for _, row in df.iterrows():
@@ -57,34 +58,6 @@ def load_shifts_from_excel(excel_path):
         shifts.append(shift_dict)
     
     print(f"✅ {len(shifts)} vardiya yüklendi")
-    return shifts
-
-
-def create_default_shifts():
-    """Varsayılan 19 vardiya (Excel yoksa kullan)"""
-    shifts = [
-        # A21 Vardiyaları
-        {'name': 'V1', 'start': '07:00', 'end': '16:00', 'company': 'A21'},
-        {'name': 'V2', 'start': '08:00', 'end': '17:00', 'company': 'A21'},
-        {'name': 'V3', 'start': '09:00', 'end': '18:00', 'company': 'A21'},
-        {'name': 'V4', 'start': '10:00', 'end': '19:00', 'company': 'A21'},
-        {'name': 'V5', 'start': '15:00', 'end': '24:00', 'company': 'A21'},
-        {'name': 'V6', 'start': '17:00', 'end': '01:00', 'company': 'A21'},
-        {'name': 'V7', 'start': '18:00', 'end': '02:00', 'company': 'A21'},
-        {'name': 'V8', 'start': '19:00', 'end': '03:00', 'company': 'A21'},
-        {'name': 'V9', 'start': '00:00', 'end': '08:00', 'company': 'A21'},
-        # B21 Vardiyaları
-        {'name': 'V10', 'start': '08:00', 'end': '17:30', 'company': 'B21'},
-        {'name': 'V11', 'start': '09:00', 'end': '18:30', 'company': 'B21'},
-        {'name': 'V12', 'start': '10:00', 'end': '19:30', 'company': 'B21'},
-        {'name': 'V13', 'start': '11:00', 'end': '20:30', 'company': 'B21'},
-        {'name': 'V14', 'start': '12:00', 'end': '21:30', 'company': 'B21'},
-        {'name': 'V15', 'start': '13:00', 'end': '22:30', 'company': 'B21'},
-        {'name': 'V16', 'start': '14:00', 'end': '23:30', 'company': 'B21'},
-        {'name': 'V17', 'start': '15:00', 'end': '00:30', 'company': 'B21'},
-        {'name': 'V18', 'start': '17:00', 'end': '01:30', 'company': 'B21'},
-        {'name': 'V19', 'start': '18:00', 'end': '02:30', 'company': 'B21'},
-    ]
     return shifts
 
 
@@ -297,14 +270,13 @@ def verify_coverage(interval_df, vardiya_df, shifts):
 # ANA FONKSİYON
 # ============================================================================
 
-def calculate_complete_planning(df, shifts=None, shift_excel=None):
+def calculate_complete_planning(df, shift_excel):
     """
     Komple kapasite planlaması
     
     Parameters:
     - df: Çağrı tahmini (date, time, queue_a, queue_b)
-    - shifts: Vardiya listesi (dict) VEYA
-    - shift_excel: Vardiya Excel dosyası yolu
+    - shift_excel: Vardiya Excel dosyası yolu (ZORUNLU)
     """
     
     print("=" * 70)
@@ -312,14 +284,8 @@ def calculate_complete_planning(df, shifts=None, shift_excel=None):
     print("=" * 70)
     
     # Vardiyaları yükle
-    if shift_excel:
-        print(f"\n📂 Vardiyalar Excel'den yükleniyor: {shift_excel}")
-        shifts = load_shifts_from_excel(shift_excel)
-    elif shifts is None:
-        print("\n📂 Varsayılan 19 vardiya kullanılıyor")
-        shifts = create_default_shifts()
-    else:
-        print(f"\n📂 {len(shifts)} vardiya kullanılıyor")
+    print(f"\n📂 Vardiyalar yükleniyor: {shift_excel}")
+    shifts = load_shifts_from_excel(shift_excel)
     
     # BÖLÜM 1: Interval bazlı ihtiyaç
     print("\n⚙️ BÖLÜM 1: Interval bazlı agent ihtiyacı hesaplanıyor...")
@@ -327,7 +293,7 @@ def calculate_complete_planning(df, shifts=None, shift_excel=None):
     print(f"✅ {len(interval_df)} interval hesaplandı")
     print(f"   Peak: {interval_df['total_agents'].max()} agent")
     
-    # BÖLÜM 2: Vardiyalara dağıt (SAAT BAZLI - YENİ)
+    # BÖLÜM 2: Vardiyalara dağıt (SAAT BAZLI)
     print("\n⚙️ BÖLÜM 2: Vardiyalara SAAT BAZLI dağıtım yapılıyor...")
     distribution_df = distribute_by_hour(interval_df, shifts)
     
@@ -436,25 +402,30 @@ if __name__ == '__main__':
     
     print("""
 ╔══════════════════════════════════════════════════════════════════╗
-║  KOMPLE KAPASİTE PLANLAMA - V2 (SAAT BAZLI DAĞITIM)             ║
+║  KOMPLE KAPASİTE PLANLAMA - V2                                   ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 KULLANIM:
 
-# YÖNTEM 1: SQL'den oku
-from sqlalchemy import create_engine
+# 1. Vardiya Excel'i hazırla (vardiyalar.xlsx)
+#    shift | start | end   | company
+#    V1    | 07:00 | 16:00 | A21
+#    V2    | 08:00 | 17:00 | A21
 
-connection_string = "mssql+pyodbc://user:pass@server/db?driver=ODBC+Driver+17"
+# 2. SQL'den çağrı tahmini oku
 df = load_call_forecast_from_sql(connection_string)
 
+# VEYA Excel'den oku
+df = pd.read_excel('cagri_tahminleri.xlsx')
+
+# 3. Hesapla
 interval_df, vardiya_df, verify_df = calculate_complete_planning(
     df, 
     shift_excel='vardiyalar.xlsx'
 )
 
-# YÖNTEM 2: Excel'den oku (eski yöntem)
-df = pd.read_excel('cagri_tahminleri.xlsx')
-interval_df, vardiya_df, verify_df = calculate_complete_planning(df)
+# 4. Kaydet
+vardiya_df.to_excel('vardiya_plani.xlsx', index=False)
 
 ═══════════════════════════════════════════════════════════════════
 """)
@@ -467,48 +438,47 @@ interval_df, vardiya_df, verify_df = calculate_complete_planning(df)
     print("\n📊 Örnek 2 günlük veri oluşturuluyor...")
     df = create_sample_data()
     print(f"✅ {len(df)} satır veri hazır")
-    print(f"   Tarih aralığı: {df['date'].min()} - {df['date'].max()}")
-    print(f"   Toplam A çağrısı: {df['queue_a'].sum()}")
-    print(f"   Toplam B çağrısı: {df['queue_b'].sum()}")
     
-    # İlk 10 satırı göster
-    print("\nİlk 10 satır:")
-    print(df.head(10).to_string(index=False))
+    # Örnek vardiya Excel'i oluştur
+    print("\n📂 Örnek vardiya Excel'i oluşturuluyor...")
+    sample_shifts = pd.DataFrame([
+        {'shift': 'V1', 'start': '07:00', 'end': '16:00', 'company': 'A21'},
+        {'shift': 'V2', 'start': '08:00', 'end': '17:00', 'company': 'A21'},
+        {'shift': 'V3', 'start': '09:00', 'end': '18:00', 'company': 'A21'},
+        {'shift': 'V10', 'start': '08:00', 'end': '17:30', 'company': 'B21'},
+        {'shift': 'V11', 'start': '09:00', 'end': '18:30', 'company': 'B21'},
+    ])
+    sample_shifts.to_excel('_test_vardiyalar.xlsx', index=False)
+    print("✅ _test_vardiyalar.xlsx oluşturuldu")
     
     # Hesapla
     print("\n" + "=" * 70)
-    interval_df, vardiya_df, verify_df = calculate_complete_planning(df)
+    interval_df, vardiya_df, verify_df = calculate_complete_planning(
+        df, 
+        shift_excel='_test_vardiyalar.xlsx'
+    )
     
     # Sonuçları göster
     print("\n" + "=" * 70)
     print("📊 SONUÇLAR")
     print("=" * 70)
     
-    print("\n1️⃣ INTERVAL SONUÇLARI (İlk 10):")
-    print(interval_df[['date', 'time', 'calls_a', 'calls_b', 'agents_a', 'agents_b', 'total_agents']].head(10).to_string(index=False))
+    print("\n1️⃣ VARDİYA PLANI:")
+    print(vardiya_df.to_string(index=False))
     
-    print("\n2️⃣ VARDİYA PLANI (İlk 10):")
-    print(vardiya_df[['date', 'shift', 'start', 'end', 'agents']].head(10).to_string(index=False))
-    
-    print("\n3️⃣ DOĞRULAMA (İlk 10):")
+    print("\n2️⃣ DOĞRULAMA (İlk 10):")
     print(verify_df[['date', 'time', 'needed', 'available', 'sufficient', 'diff']].head(10).to_string(index=False))
     
     # Özet
     print("\n" + "=" * 70)
     print("📈 ÖZET")
     print("=" * 70)
-    print(f"Toplam interval: {len(interval_df)}")
     print(f"Peak agent ihtiyacı: {interval_df['total_agents'].max()}")
     print(f"Toplam vardiya-gün: {len(vardiya_df)}")
     print(f"Yeterli interval: {verify_df['sufficient'].sum()} / {len(verify_df)}")
     
     insufficient = verify_df[~verify_df['sufficient']]
     if len(insufficient) > 0:
-        print(f"\n⚠️ YETERSİZ İNTERVALLER: {len(insufficient)}")
-        print(insufficient[['date', 'time', 'needed', 'available', 'diff']].head(10).to_string(index=False))
+        print(f"\n⚠️ YETERSİZ: {len(insufficient)} interval")
     else:
         print("\n✅ TÜM İNTERVALLER YETERLİ!")
-    
-    print("\n" + "=" * 70)
-    print("✅ TEST TAMAMLANDI!")
-    print("=" * 70)
