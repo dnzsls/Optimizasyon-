@@ -189,12 +189,12 @@ def is_peak_shift(shift):
 
 def distribute_by_peak_priority(interval_df, shifts):
     """
-    PEAK ÖNCELİKLİ DAĞITIM + Gerektiği Kadar Agent
+    PEAK ÖNCELİKLİ DAĞITIM
     
-    Algoritma:
-    1. Peak saatte → Peak vardiyalara öncelik
-    2. Az yoğunsa → Sadece gerekli vardiyalara ver
-    3. Çok yoğunsa → Tüm vardiyalara dağıt
+    Mantık:
+    - Peak saatte: Peak vardiyalara %50 daha fazla ağırlık
+    - Peak dışı saatte: Tüm vardiyalara eşit
+    - Gerektiği kadar agent, sıfır olanlar kaydedilmez
     """
     results = []
     
@@ -214,53 +214,35 @@ def distribute_by_peak_priority(interval_df, shifts):
             if is_time_in_shift(time, shift['start'], shift['end']):
                 is_peak_shift_flag = is_peak_shift(shift)
                 
-                # Ağırlık belirleme
+                # Ağırlık: Peak saatte + Peak vardiya = 1.5, diğerleri 1.0
                 if is_peak and is_peak_shift_flag:
-                    weight = 1.5  # Peak saatte, peak vardiya
+                    weight = 1.5
                 else:
                     weight = 1.0
                 
                 working_shifts.append({
                     'name': shift['name'],
-                    'weight': weight,
-                    'is_peak_shift': is_peak_shift_flag
+                    'weight': weight
                 })
         
         if len(working_shifts) == 0:
             continue
         
-        # ÖNCE PEAK VARDİYALARA DAĞIT
-        peak_shifts = [ws for ws in working_shifts if ws['is_peak_shift']]
-        normal_shifts = [ws for ws in working_shifts if not ws['is_peak_shift']]
+        # Ağırlıklı dağıt
+        total_weight = sum(ws['weight'] for ws in working_shifts)
         
         distribution = {}
-        
-        # Strateji: Az yoğunsa sadece peak, çok yoğunsa herkese
-        avg_agents_per_shift = total_needed / len(working_shifts)
-        
-        if avg_agents_per_shift <= 15:  # Az yoğun
-            # Sadece peak vardiyalara ver (varsa)
-            if len(peak_shifts) > 0:
-                target_shifts = peak_shifts
-            else:
-                target_shifts = working_shifts
-        else:  # Çok yoğun
-            # Herkese ver ama peak'e daha fazla
-            target_shifts = working_shifts
-        
-        # Ağırlıklı dağıt
-        total_weight = sum(ws['weight'] for ws in target_shifts)
-        
-        for ws in target_shifts:
+        for ws in working_shifts:
             ratio = ws['weight'] / total_weight
             agents = total_needed * ratio
             distribution[ws['name']] = agents
         
-        # Tam sayıya yuvarla (iteratif)
+        # Tam sayıya yuvarla
         current_total = sum(math.floor(v) for v in distribution.values())
         needed_diff = total_needed - current_total
         
         if needed_diff > 0:
+            # En yüksek ondalık kısma sahip olanlara 1'er ekle
             decimals = {k: v - math.floor(v) for k, v in distribution.items()}
             sorted_shifts = sorted(decimals.items(), key=lambda x: x[1], reverse=True)
             
@@ -268,14 +250,15 @@ def distribute_by_peak_priority(interval_df, shifts):
                 shift_name = sorted_shifts[i % len(sorted_shifts)][0]
                 distribution[shift_name] += 1
         
-        # Sonuçları kaydet
+        # Sonuçları kaydet (sadece agent > 0 olanlar)
         for shift_name, agents in distribution.items():
-            if agents > 0:  # Sadece agent alanları kaydet
+            final_agents = math.floor(agents)
+            if final_agents > 0:
                 results.append({
                     'date': date,
                     'time': time,
                     'shift': shift_name,
-                    'agents_needed': math.floor(agents),
+                    'agents_needed': final_agents,
                     'is_peak': is_peak
                 })
     
