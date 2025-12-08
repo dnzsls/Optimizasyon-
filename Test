@@ -165,7 +165,7 @@ def is_time_in_shift(time_str, shift_start, shift_end):
 
 
 # ============================================================================
-# BÖLÜM 2: VARDİYALARA AKILLI DAĞITIM (PEAK + İTERATİF)
+# BÖLÜM 2: VARDİYALARA AKILLI DAĞITIM (SADECE PEAK)
 # ============================================================================
 
 # Peak saat tanımları
@@ -181,61 +181,20 @@ def is_peak_hour(time_str):
     return PEAK_HOURS['start'] <= hour < PEAK_HOURS['end']
 
 
-def calculate_shift_weight(shift, time_str):
-    """
-    Vardiya ağırlığı hesapla
-    
-    Faktörler:
-    1. Peak saate yakınlık
-    2. Vardiya içinde kaçıncı saat (taze/yorgun)
-    """
+def is_peak_shift(shift):
+    """Bu vardiya peak saatlerde mi başlıyor?"""
     shift_start_hour = int(shift['start'].split(':')[0])
-    shift_end_hour = int(shift['end'].split(':')[0])
-    current_hour = int(time_str.split(':')[0])
-    
-    # Gece vardiyası düzeltmesi
-    if shift_end_hour <= shift_start_hour:
-        shift_end_hour += 24
-    if current_hour < shift_start_hour:
-        current_hour += 24
-    
-    # 1. Peak saate yakınlık
-    if is_peak_hour(time_str):
-        # Peak saatte başlayan vardiyalar avantajlı
-        if PEAK_HOURS['start'] <= shift_start_hour < PEAK_HOURS['end']:
-            peak_weight = 1.5  # %50 fazla
-        else:
-            peak_weight = 1.0
-    else:
-        # Peak dışı saatte başlayan vardiyalar avantajlı
-        if shift_start_hour < PEAK_HOURS['start'] or shift_start_hour >= PEAK_HOURS['end']:
-            peak_weight = 1.3
-        else:
-            peak_weight = 1.0
-    
-    # 2. Vardiya içinde kaçıncı saat (taze agentlar avantajlı)
-    hours_worked = current_hour - shift_start_hour
-    total_hours = shift_end_hour - shift_start_hour
-    
-    if hours_worked <= total_hours * 0.3:  # İlk %30
-        freshness_weight = 1.2  # Taze
-    elif hours_worked >= total_hours * 0.8:  # Son %20
-        freshness_weight = 0.8  # Yorgun
-    else:
-        freshness_weight = 1.0  # Orta
-    
-    return peak_weight * freshness_weight
+    return PEAK_HOURS['start'] <= shift_start_hour < PEAK_HOURS['end']
 
 
-def distribute_by_smart_algorithm(interval_df, shifts):
+def distribute_by_peak_priority(interval_df, shifts):
     """
-    AKILLI DAĞITIM: Peak + İteratif Optimizasyon
+    PEAK ÖNCELİKLİ DAĞITIM + Gerektiği Kadar Agent
     
     Algoritma:
-    1. Her saat için çalışan vardiyaları bul
-    2. Ağırlıkları hesapla (peak + tazelik)
-    3. Ağırlığa göre ilk dağılım yap
-    4. Yetersizse iteratif artır
+    1. Peak saatte → Peak vardiyalara öncelik
+    2. Az yoğunsa → Sadece gerekli vardiyalara ver
+    3. Çok yoğunsa → Tüm vardiyalara dağıt
     """
     results = []
     
@@ -247,55 +206,78 @@ def distribute_by_smart_algorithm(interval_df, shifts):
         if total_needed == 0:
             continue
         
+        is_peak = is_peak_hour(time)
+        
         # Bu saatte çalışan vardiyalar
         working_shifts = []
         for shift in shifts:
             if is_time_in_shift(time, shift['start'], shift['end']):
-                weight = calculate_shift_weight(shift, time)
+                is_peak_shift_flag = is_peak_shift(shift)
+                
+                # Ağırlık belirleme
+                if is_peak and is_peak_shift_flag:
+                    weight = 1.5  # Peak saatte, peak vardiya
+                else:
+                    weight = 1.0
+                
                 working_shifts.append({
                     'name': shift['name'],
                     'weight': weight,
-                    'start': shift['start'],
-                    'end': shift['end']
+                    'is_peak_shift': is_peak_shift_flag
                 })
         
         if len(working_shifts) == 0:
             continue
         
-        # AĞIRLIKLI DAĞITIM
-        total_weight = sum(ws['weight'] for ws in working_shifts)
+        # ÖNCE PEAK VARDİYALARA DAĞIT
+        peak_shifts = [ws for ws in working_shifts if ws['is_peak_shift']]
+        normal_shifts = [ws for ws in working_shifts if not ws['is_peak_shift']]
         
-        initial_distribution = {}
-        for ws in working_shifts:
+        distribution = {}
+        
+        # Strateji: Az yoğunsa sadece peak, çok yoğunsa herkese
+        avg_agents_per_shift = total_needed / len(working_shifts)
+        
+        if avg_agents_per_shift <= 15:  # Az yoğun
+            # Sadece peak vardiyalara ver (varsa)
+            if len(peak_shifts) > 0:
+                target_shifts = peak_shifts
+            else:
+                target_shifts = working_shifts
+        else:  # Çok yoğun
+            # Herkese ver ama peak'e daha fazla
+            target_shifts = working_shifts
+        
+        # Ağırlıklı dağıt
+        total_weight = sum(ws['weight'] for ws in target_shifts)
+        
+        for ws in target_shifts:
             ratio = ws['weight'] / total_weight
             agents = total_needed * ratio
-            initial_distribution[ws['name']] = agents
+            distribution[ws['name']] = agents
         
-        # İTERATİF OPTİMİZASYON
-        # Toplam tam sayıya yuvarlandığında eksik/fazla olabilir
-        current_total = sum(math.floor(v) for v in initial_distribution.values())
+        # Tam sayıya yuvarla (iteratif)
+        current_total = sum(math.floor(v) for v in distribution.values())
         needed_diff = total_needed - current_total
         
-        # Eksik varsa, en yüksek ondalık kısma sahip olanlara ver
         if needed_diff > 0:
-            decimals = {k: v - math.floor(v) for k, v in initial_distribution.items()}
+            decimals = {k: v - math.floor(v) for k, v in distribution.items()}
             sorted_shifts = sorted(decimals.items(), key=lambda x: x[1], reverse=True)
             
             for i in range(needed_diff):
                 shift_name = sorted_shifts[i % len(sorted_shifts)][0]
-                initial_distribution[shift_name] += 1
+                distribution[shift_name] += 1
         
         # Sonuçları kaydet
-        for shift_name, agents in initial_distribution.items():
-            ws_info = next(ws for ws in working_shifts if ws['name'] == shift_name)
-            results.append({
-                'date': date,
-                'time': time,
-                'shift': shift_name,
-                'agents_needed': math.floor(agents),
-                'weight': ws_info['weight'],
-                'is_peak': is_peak_hour(time)
-            })
+        for shift_name, agents in distribution.items():
+            if agents > 0:  # Sadece agent alanları kaydet
+                results.append({
+                    'date': date,
+                    'time': time,
+                    'shift': shift_name,
+                    'agents_needed': math.floor(agents),
+                    'is_peak': is_peak
+                })
     
     return pd.DataFrame(results)
 
@@ -386,10 +368,10 @@ def calculate_complete_planning(df, shift_excel):
     print(f"✅ {len(interval_df)} interval hesaplandı")
     print(f"   Peak: {interval_df['total_agents'].max()} agent")
     
-    # BÖLÜM 2: Vardiyalara dağıt (AKILLI DAĞITIM)
-    print("\n⚙️ BÖLÜM 2: Vardiyalara AKILLI dağıtım yapılıyor...")
+    # BÖLÜM 2: Vardiyalara dağıt (PEAK ÖNCELİKLİ)
+    print("\n⚙️ BÖLÜM 2: Vardiyalara PEAK ÖNCELİKLİ dağıtım yapılıyor...")
     print(f"   Peak saatler: {PEAK_HOURS['start']}:00 - {PEAK_HOURS['end']}:00")
-    distribution_df = distribute_by_smart_algorithm(interval_df, shifts)
+    distribution_df = distribute_by_peak_priority(interval_df, shifts)
     
     print("\n⚙️ BÖLÜM 3: Vardiya bazlı toplama yapılıyor...")
     vardiya_df = aggregate_shifts(distribution_df, shifts)
