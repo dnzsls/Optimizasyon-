@@ -218,13 +218,45 @@ def calculate_interval_requirements(df, config):
 
 
 # ============================================================================
-# BÖLÜM 4: AYLIK SERVICE LEVEL KONTROLÜ
+# BÖLÜM 4: GÜNLÜK ve AYLIK SERVICE LEVEL KONTROLÜ
 # ============================================================================
+
+def calculate_daily_sl(interval_df):
+    """
+    Günlük Service Level hesapla
+    Her gün için toplam SL (bilgi amaçlı, zorunlu değil)
+    """
+    daily_results = []
+    
+    for date in sorted(interval_df['date'].unique()):
+        day_data = interval_df[interval_df['date'] == date]
+        
+        total_calls_a = day_data['calls_a'].sum()
+        total_calls_b = day_data['calls_b'].sum()
+        
+        # Ağırlıklı ortalama SL
+        weighted_sl_a = (day_data['calls_a'] * day_data['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
+        weighted_sl_b = (day_data['calls_b'] * day_data['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
+        
+        total_calls = total_calls_a + total_calls_b
+        daily_sl = ((total_calls_a * weighted_sl_a) + (total_calls_b * weighted_sl_b)) / total_calls if total_calls > 0 else 0
+        
+        daily_results.append({
+            'date': date,
+            'total_calls': int(total_calls),
+            'daily_sl_a': round(weighted_sl_a, 2),
+            'daily_sl_b': round(weighted_sl_b, 2),
+            'daily_sl_overall': round(daily_sl, 2),
+            'info': 'Günlük takip (zorunlu değil)'
+        })
+    
+    return pd.DataFrame(daily_results)
+
 
 def calculate_monthly_sl(interval_df):
     """
     Aylık toplam Service Level hesapla
-    Tüm çağrıların toplamda %80'i 30 sn içinde yanıtlandı mı?
+    ZORUNLU HEDEF: Ay toplamında %80
     """
     total_calls_a = interval_df['calls_a'].sum()
     total_calls_b = interval_df['calls_b'].sum()
@@ -237,9 +269,9 @@ def calculate_monthly_sl(interval_df):
     overall_sl = ((total_calls_a * weighted_sl_a) + (total_calls_b * weighted_sl_b)) / total_calls if total_calls > 0 else 0
     
     return {
-        'total_calls_a': total_calls_a,
-        'total_calls_b': total_calls_b,
-        'total_calls': total_calls,
+        'total_calls_a': int(total_calls_a),
+        'total_calls_b': int(total_calls_b),
+        'total_calls': int(total_calls),
         'monthly_sl_a': round(weighted_sl_a, 2),
         'monthly_sl_b': round(weighted_sl_b, 2),
         'overall_sl': round(overall_sl, 2),
@@ -399,18 +431,17 @@ def aggregate_shifts(distribution_df, shifts):
 def calculate_complete_planning(df, shift_excel):
     """
     Komple kapasite planlaması
-    ASA + SL kontrollü
+    ASA + SL kontrollü (Günlük + Aylık)
     """
     
     print("=" * 80)
-    print("KAPASİTE PLANLAMA SİSTEMİ - V3 (ASA + SL)")
+    print("KAPASİTE PLANLAMA SİSTEMİ - V3 (ASA + GÜNLÜK/AYLIK SL)")
     print("=" * 80)
     print(f"\n⚙️ Konfigürasyon:")
     print(f"   İnterval: {CONFIG['interval_minutes']} dakika")
-    print(f"   AHT: {CONFIG['aht']} saniye")
-    print(f"   Hedef ASA: ≤ {CONFIG['target_asa']} saniye")
-    print(f"   Hedef SL: ≥ %{CONFIG['target_sl']*100} ({CONFIG['target_seconds']} sn içinde)")
-    print(f"   Peak saatler: {CONFIG['peak_hours']['start']}:00 - {CONFIG['peak_hours']['end']}:00")
+    print(f"   Her saat: ASA ≤ {CONFIG['target_asa']} saniye (müşteri deneyimi)")
+    print(f"   Her gün: SL ≥ %{CONFIG['target_sl']*100} (günlük hedef)")
+    print(f"   Ay toplam: SL ≥ %{CONFIG['target_sl']*100} (aylık hedef)")
     
     # Vardiyalar
     print(f"\n📂 Vardiyalar yükleniyor: {shift_excel}")
@@ -423,16 +454,30 @@ def calculate_complete_planning(df, shift_excel):
     print(f"✅ {len(interval_df)} interval hesaplandı")
     print(f"   Peak agent: {interval_df['total_agents'].max()}")
     
-    # BÖLÜM 2: Aylık SL kontrol
-    print("\n⚙️ BÖLÜM 2: Aylık Service Level kontrolü...")
+    # BÖLÜM 2: Günlük SL (bilgi amaçlı)
+    print("\n⚙️ BÖLÜM 2: Günlük Service Level (takip)...")
+    daily_sl_df = calculate_daily_sl(interval_df)
+    
+    avg_daily_sl = daily_sl_df['daily_sl_overall'].mean()
+    min_daily_sl = daily_sl_df['daily_sl_overall'].min()
+    max_daily_sl = daily_sl_df['daily_sl_overall'].max()
+    
+    print(f"✅ Günlük SL dağılımı:")
+    print(f"   Ortalama: %{avg_daily_sl:.1f}")
+    print(f"   Min: %{min_daily_sl:.1f} (En düşük gün)")
+    print(f"   Max: %{max_daily_sl:.1f} (En yüksek gün)")
+    print(f"   → Günlük %78-82 arası normal (telafi edilir)")
+    
+    # BÖLÜM 3: Aylık SL (ZORUNLU)
+    print("\n⚙️ BÖLÜM 3: Aylık Service Level (ZORUNLU HEDEF)...")
     monthly_sl = calculate_monthly_sl(interval_df)
     print(f"✅ Aylık SL: %{monthly_sl['overall_sl']:.1f}")
     print(f"   A Kuyruğu: %{monthly_sl['monthly_sl_a']:.1f}")
     print(f"   B Kuyruğu: %{monthly_sl['monthly_sl_b']:.1f}")
     print(f"   Hedef (%{CONFIG['target_sl']*100}): {'✅ KARŞILANDI' if monthly_sl['target_met'] else '❌ KARŞILANMADI'}")
     
-    # BÖLÜM 3: Vardiya dağıt
-    print("\n⚙️ BÖLÜM 3: Vardiyalara dağıtım...")
+    # BÖLÜM 4: Vardiya dağıt
+    print("\n⚙️ BÖLÜM 4: Vardiyalara dağıtım...")
     distribution_df = distribute_to_shifts(interval_df, shifts)
     
     vardiya_df = aggregate_shifts(distribution_df, shifts)
@@ -442,7 +487,7 @@ def calculate_complete_planning(df, shift_excel):
     print("✅ TAMAMLANDI!")
     print("=" * 80)
     
-    return interval_df, vardiya_df, monthly_sl
+    return interval_df, vardiya_df, daily_sl_df, monthly_sl
 
 
 # ============================================================================
@@ -462,7 +507,7 @@ df = pd.read_excel('cagri_tahminleri.xlsx')
 # Kolonlar: date, time, queue_a, queue_b
 
 # Hesapla
-interval_df, vardiya_df, monthly_sl = calculate_complete_planning(
+interval_df, vardiya_df, daily_sl_df, monthly_sl = calculate_complete_planning(
     df,
     shift_excel='vardiyalar.xlsx'
 )
@@ -470,4 +515,5 @@ interval_df, vardiya_df, monthly_sl = calculate_complete_planning(
 # Kaydet
 interval_df.to_excel('sonuc_interval.xlsx', index=False)
 vardiya_df.to_excel('sonuc_vardiya.xlsx', index=False)
+daily_sl_df.to_excel('sonuc_gunluk_sl.xlsx', index=False)
 """)
