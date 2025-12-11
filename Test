@@ -16,12 +16,10 @@ import math
 # ============================================================================
 
 CONFIG = {
-    'aht': 180,              # Average Handle Time - saniye
+    'aht': 188,              # Average Handle Time - saniye (gerçek değer)
     'target_asa': 30,        # Hedef ASA - saniye
-    'target_sl': 0.80,       # Hedef Service Level - %80
-    'min_sl': 0.75,          # Minimum SL floor - %75 (asla altına düşmez)
+    'target_sl': 0.80,       # Hedef Service Level - %80 (aylık kontrol)
     'target_seconds': 30,    # SL için hedef süre - saniye
-    'sl_tolerance': 0.02,    # SL tolerans (±%2)
     'shrinkage': 0.10,       # Mola/izin payı - %10
     'interval_minutes': 60,  # İnterval - dakika
     'peak_hours': {
@@ -234,58 +232,43 @@ def find_agents_for_sl(calls, interval_min, aht, target_sl, target_seconds, tole
 
 def find_optimal_agents(calls, config):
     """
-    Hem ASA hem SL için optimal agent sayısı
+    Sadece ASA bazlı agent hesabı
+    SL interval bazında hedef değil, aylık kontrol için hesaplanıyor
     
     ADIM ADIM:
-    1. Çağrı yoksa → (0,0,0,0,0) döndür
+    1. Çağrı yoksa → (0,0,0) döndür
     2. ASA için gereken agent sayısını bul
-    3. SL için gereken agent sayısını bul (min_sl floor ile)
-    4. İkisinden büyük olanı seç (her iki hedefi de karşılar)
-    5. Shrinkage ekle (mola/izin payı)
-    6. Final metrikleri hesapla
+    3. Shrinkage ekle (mola/izin payı)
+    4. SL'yi bilgi amaçlı hesapla (karar verici değil)
     
     Parametreler:
         calls: Çağrı sayısı
         config: Konfigürasyon dictionary
     
     Döndürür:
-        (agents_final, agents_asa, agents_sl, final_asa, final_sl)
+        (agents_final, final_asa, final_sl)
     """
     # ADIM 1: Çağrı kontrolü
     if calls == 0:
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0
     
-    # ADIM 2: ASA için agent sayısı
-    agents_asa = find_agents_for_asa(
+    # ADIM 2: Sadece ASA için agent sayısı
+    agents_raw = find_agents_for_asa(
         calls, 
         config['interval_minutes'],
         config['aht'],
         config['target_asa']
     )
     
-    # ADIM 3: SL için agent sayısı (min_sl floor ile)
-    agents_sl = find_agents_for_sl(
-        calls,
-        config['interval_minutes'],
-        config['aht'],
-        config['target_sl'],
-        config['target_seconds'],
-        config['sl_tolerance'],
-        config['min_sl']  # Hard floor: %75
-    )
-    
-    # ADIM 4: İkisinden büyük olanı seç
-    agents_raw = max(agents_asa, agents_sl)
-    
-    # ADIM 5: Shrinkage ekle
+    # ADIM 3: Shrinkage ekle
     agents_final = math.ceil(agents_raw / (1 - config['shrinkage']))
     
-    # ADIM 6: Final metrikleri hesapla (kontrol amaçlı)
+    # ADIM 4: SL'yi bilgi amaçlı hesapla (aylık kontrolde kullanılacak)
     traffic = calculate_traffic(calls, config['interval_minutes'], config['aht'])
     final_asa = calculate_asa(agents_raw, traffic, config['aht'])
     final_sl = calculate_service_level(agents_raw, traffic, config['aht'], config['target_seconds'])
     
-    return agents_final, agents_asa, agents_sl, final_asa, final_sl
+    return agents_final, final_asa, final_sl
 
 
 # ============================================================================
@@ -293,7 +276,7 @@ def find_optimal_agents(calls, config):
 # ============================================================================
 
 def calculate_interval_requirements(df, config):
-    """Her interval için agent ihtiyacını hesapla (ASA + SL)"""
+    """Her interval için agent ihtiyacını hesapla (Sadece ASA bazlı)"""
     results = []
     
     for idx, row in df.iterrows():
@@ -309,9 +292,9 @@ def calculate_interval_requirements(df, config):
         calls_a = row['queue_a']
         calls_b = row['queue_b']
         
-        # Her queue için optimal agent bul
-        agents_a, asa_agents_a, sl_agents_a, final_asa_a, final_sl_a = find_optimal_agents(calls_a, config)
-        agents_b, asa_agents_b, sl_agents_b, final_asa_b, final_sl_b = find_optimal_agents(calls_b, config)
+        # Her queue için optimal agent bul (sadece ASA bazlı)
+        agents_a, final_asa_a, final_sl_a = find_optimal_agents(calls_a, config)
+        agents_b, final_asa_b, final_sl_b = find_optimal_agents(calls_b, config)
         
         results.append({
             'date': date,
@@ -324,9 +307,7 @@ def calculate_interval_requirements(df, config):
             'asa_a': round(final_asa_a, 1),
             'sl_a': round(final_sl_a * 100, 1),
             'asa_b': round(final_asa_b, 1),
-            'sl_b': round(final_sl_b * 100, 1),
-            'constraint_a': 'ASA' if asa_agents_a >= sl_agents_a else 'SL',
-            'constraint_b': 'ASA' if asa_agents_b >= sl_agents_b else 'SL'
+            'sl_b': round(final_sl_b * 100, 1)
         })
     
     return pd.DataFrame(results)
@@ -595,13 +576,13 @@ def calculate_complete_planning(df, shift_excel):
     """
     
     print("=" * 80)
-    print("KAPASİTE PLANLAMA SİSTEMİ - V2")
+    print("KAPASİTE PLANLAMA SİSTEMİ - V2 (ASA BAZLI)")
     print("=" * 80)
     print(f"\n⚙️ Hedefler:")
     print(f"   Saatlik: ASA ≤ {CONFIG['target_asa']} saniye")
-    print(f"   Minimum SL: ≥ %{CONFIG['min_sl']*100} (hard floor)")
-    print(f"   Hedef SL: %{CONFIG['target_sl']*100}")
-    print(f"   Aylık: SL ≥ %{CONFIG['target_sl']*100} (ZORUNLU)")
+    print(f"   Aylık SL: ≥ %{CONFIG['target_sl']*100} (kontrol)")
+    print(f"   AHT: {CONFIG['aht']} saniye")
+    print(f"   Shrinkage: %{CONFIG['shrinkage']*100}")
     print(f"   Compliance: %{CONFIG['compliance']['min_sl']}-%{CONFIG['compliance']['max_sl']} aralığı")
     
     print(f"\n📂 Vardiyalar: {shift_excel}")
