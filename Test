@@ -1,112 +1,189 @@
 """
-KOMPLE KAPASİTE PLANLAMA - V2
-Vardiyalar Excel'den okunur, saat bazlı kesişim
+KOMPLE KAPASİTE PLANLAMA SİSTEMİ - V3
+ASA + Service Level İkili Kontrolü
 """
 import pandas as pd
 import math
 
-# ============= KONFIGURASYON =============
+# ============================================================================
+# KONFIGURASYON
+# ============================================================================
 
 CONFIG = {
     'aht': 180,              # Average Handle Time - saniye
-    'target_asa': 30,        # Hedef yanıt süresi - saniye
+    'target_asa': 30,        # Hedef ASA - saniye
+    'target_sl': 0.80,       # Hedef Service Level - %80
+    'target_seconds': 30,    # SL için hedef süre - saniye
+    'sl_tolerance': 0.02,    # SL tolerans (±%2)
     'shrinkage': 0.10,       # Mola/izin payı - %10
-    'interval_minutes': 15   # İnterval - dakika
+    'interval_minutes': 60,  # İnterval - dakika
+    'peak_hours': {
+        'start': 9,          # Peak başlangıç
+        'end': 18            # Peak bitiş
+    }
 }
 
 
 # ============================================================================
-# VARDİYA OKUMA (EXCEL'DEN) - ZORUNLU
-# ============================================================================
-
-def load_shifts_from_excel(excel_path):
-    """
-    Excel'den vardiya tanımlarını oku - ZORUNLU
-    
-    Excel formatı:
-    - shift: Vardiya adı (V1, V2, ...)
-    - start: Başlangıç saati ('07:00')
-    - end: Bitiş saati ('16:00')
-    - company: (Opsiyonel) A21 veya B21
-    
-    Örnek:
-    shift  | start | end   | company
-    V1     | 07:00 | 16:00 | A21
-    V2     | 08:00 | 17:00 | A21
-    V2     | 08:00 | 17:00 | B21  ← Aynı vardiya, farklı firma
-    """
-    df = pd.read_excel(excel_path)
-    
-    # Gerekli kolonlar
-    required = ['shift', 'start', 'end']
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise ValueError(f"❌ Eksik kolonlar: {missing}")
-    
-    shifts = []
-    for _, row in df.iterrows():
-        shift_dict = {
-            'name': str(row['shift']),
-            'start': str(row['start']) if not hasattr(row['start'], 'strftime') else row['start'].strftime('%H:%M'),
-            'end': str(row['end']) if not hasattr(row['end'], 'strftime') else row['end'].strftime('%H:%M')
-        }
-        
-        # Opsiyonel: company kolonu
-        if 'company' in df.columns:
-            shift_dict['company'] = str(row['company'])
-        
-        shifts.append(shift_dict)
-    
-    print(f"✅ {len(shifts)} vardiya yüklendi")
-    return shifts
-
-
-# ============================================================================
-# BÖLÜM 1: INTERVAL BAZLI AGENT İHTİYACI (ERLANG C)
+# BÖLÜM 1: ERLANG C TEMELLERİ
 # ============================================================================
 
 def erlang_c(agents, traffic):
+    """Erlang C: Kuyrukta bekleme olasılığı"""
     if agents <= traffic or agents == 0:
         return 1.0
+    
     erlang_b = traffic / agents
     for i in range(2, int(agents) + 1):
         erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
+    
     erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
     return min(erlang_c_val, 1.0)
 
 
 def calculate_asa(agents, traffic, aht):
-    if agents <= traffic:
+    """ASA (Average Speed to Answer) hesapla - saniye"""
+    if agents <= traffic or agents == 0:
         return 999
+    
     ec = erlang_c(agents, traffic)
     asa = (ec * (aht / 60)) / (agents - traffic) * 60
     return asa
 
 
-def find_agents_for_target(calls, interval_min, aht, target_asa):
+def calculate_service_level(agents, traffic, aht, target_seconds):
+    """Service Level hesapla - %80 çağrı X saniye içinde"""
+    if agents <= traffic or agents == 0:
+        return 0.0
+    
+    ec = erlang_c(agents, traffic)
+    exp_term = math.exp(-(agents - traffic) * (target_seconds / aht))
+    sl = 1 - (ec * exp_term)
+    
+    return max(0, min(1, sl))
+
+
+def calculate_traffic(calls, interval_min, aht):
+    """Traffic (Erlang) hesapla"""
     if calls == 0:
         return 0
-    traffic = (calls * (aht / 60)) / interval_min
+    return (calls * (aht / 60)) / interval_min
+
+
+# ============================================================================
+# BÖLÜM 2: AGENT SAYISI BULMA (ASA + SL)
+# ============================================================================
+
+def find_agents_for_asa(calls, interval_min, aht, target_asa):
+    """ASA hedefi için gereken agent sayısı"""
+    if calls == 0:
+        return 0
+    
+    traffic = calculate_traffic(calls, interval_min, aht)
     if traffic == 0:
         return 0
+    
     min_agents = math.ceil(traffic)
     max_agents = math.ceil(traffic * 2) + 5
+    
     for agents in range(min_agents, max_agents + 1):
         asa = calculate_asa(agents, traffic, aht)
         if asa <= target_asa:
             return agents
+    
     return max_agents
 
 
-def calculate_interval_requirements(df):
-    """Her interval için agent ihtiyacını hesapla"""
+def find_agents_for_sl(calls, interval_min, aht, target_sl, target_seconds, tolerance):
+    """
+    SL hedefi için gereken agent sayısı
+    Target ±tolerance aralığında en yakın agent sayısını bul
+    """
+    if calls == 0:
+        return 0
+    
+    traffic = calculate_traffic(calls, interval_min, aht)
+    if traffic == 0:
+        return 0
+    
+    min_agents = math.ceil(traffic)
+    max_agents = math.ceil(traffic * 2) + 10
+    
+    best_agent = max_agents
+    best_diff = 1.0
+    
+    for agents in range(min_agents, max_agents + 1):
+        sl = calculate_service_level(agents, traffic, aht, target_seconds)
+        diff = abs(sl - target_sl)
+        
+        # Tolerans içinde ve daha yakınsa
+        if diff <= tolerance and diff < best_diff:
+            best_agent = agents
+            best_diff = diff
+            
+            # Tam hedefi bulduysak dur
+            if diff < 0.001:
+                break
+    
+    return best_agent
+
+
+def find_optimal_agents(calls, config):
+    """
+    Hem ASA hem SL için optimal agent sayısı
+    İkisinden büyük olanı seç (her ikisini de karşılar)
+    """
+    if calls == 0:
+        return 0, 0, 0, 0, 0
+    
+    # ASA için agent
+    agents_asa = find_agents_for_asa(
+        calls, 
+        config['interval_minutes'],
+        config['aht'],
+        config['target_asa']
+    )
+    
+    # SL için agent
+    agents_sl = find_agents_for_sl(
+        calls,
+        config['interval_minutes'],
+        config['aht'],
+        config['target_sl'],
+        config['target_seconds'],
+        config['sl_tolerance']
+    )
+    
+    # İkisinden büyük olanı seç
+    agents_raw = max(agents_asa, agents_sl)
+    
+    # Shrinkage ekle
+    agents_final = math.ceil(agents_raw / (1 - config['shrinkage']))
+    
+    # Metrikleri hesapla
+    traffic = calculate_traffic(calls, config['interval_minutes'], config['aht'])
+    final_asa = calculate_asa(agents_raw, traffic, config['aht'])
+    final_sl = calculate_service_level(agents_raw, traffic, config['aht'], config['target_seconds'])
+    
+    return agents_final, agents_asa, agents_sl, final_asa, final_sl
+
+
+# ============================================================================
+# BÖLÜM 3: INTERVAL BAZLI İHTİYAÇ
+# ============================================================================
+
+def calculate_interval_requirements(df, config):
+    """
+    Her interval için agent ihtiyacını hesapla
+    Hem ASA hem SL kontrolü ile
+    """
     results = []
     
     for idx, row in df.iterrows():
         date = row['date']
         time = row['time']
         
-        # Time object ise string'e çevir
+        # Time object kontrolü
         if hasattr(time, 'strftime'):
             time = time.strftime('%H:%M')
         elif not isinstance(time, str):
@@ -115,38 +192,88 @@ def calculate_interval_requirements(df):
         calls_a = row['queue_a']
         calls_b = row['queue_b']
         
-        # A için
-        agents_a_raw = find_agents_for_target(
-            calls_a, CONFIG['interval_minutes'], 
-            CONFIG['aht'], CONFIG['target_asa']
-        )
-        agents_a_final = math.ceil(agents_a_raw / (1 - CONFIG['shrinkage']))
+        # A kuyruğu için
+        agents_a, asa_agents_a, sl_agents_a, final_asa_a, final_sl_a = find_optimal_agents(calls_a, config)
         
-        # B için
-        agents_b_raw = find_agents_for_target(
-            calls_b, CONFIG['interval_minutes'],
-            CONFIG['aht'], CONFIG['target_asa']
-        )
-        agents_b_final = math.ceil(agents_b_raw / (1 - CONFIG['shrinkage']))
+        # B kuyruğu için
+        agents_b, asa_agents_b, sl_agents_b, final_asa_b, final_sl_b = find_optimal_agents(calls_b, config)
         
         results.append({
             'date': date,
             'time': time,
             'calls_a': calls_a,
             'calls_b': calls_b,
-            'agents_a': agents_a_final,
-            'agents_b': agents_b_final,
-            'total_agents': agents_a_final + agents_b_final
+            'agents_a': agents_a,
+            'agents_b': agents_b,
+            'total_agents': agents_a + agents_b,
+            'asa_a': round(final_asa_a, 1),
+            'sl_a': round(final_sl_a * 100, 1),
+            'asa_b': round(final_asa_b, 1),
+            'sl_b': round(final_sl_b * 100, 1),
+            'constraint_a': 'ASA' if asa_agents_a >= sl_agents_a else 'SL',
+            'constraint_b': 'ASA' if asa_agents_b >= sl_agents_b else 'SL'
         })
     
     return pd.DataFrame(results)
 
 
 # ============================================================================
-# BÖLÜM 2: VARDİYALARA SAAT BAZLI DAĞITIM (YENİ)
+# BÖLÜM 4: AYLIK SERVICE LEVEL KONTROLÜ
 # ============================================================================
 
+def calculate_monthly_sl(interval_df):
+    """
+    Aylık toplam Service Level hesapla
+    Tüm çağrıların toplamda %80'i 30 sn içinde yanıtlandı mı?
+    """
+    total_calls_a = interval_df['calls_a'].sum()
+    total_calls_b = interval_df['calls_b'].sum()
+    
+    # Ağırlıklı ortalama SL
+    weighted_sl_a = (interval_df['calls_a'] * interval_df['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
+    weighted_sl_b = (interval_df['calls_b'] * interval_df['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
+    
+    total_calls = total_calls_a + total_calls_b
+    overall_sl = ((total_calls_a * weighted_sl_a) + (total_calls_b * weighted_sl_b)) / total_calls if total_calls > 0 else 0
+    
+    return {
+        'total_calls_a': total_calls_a,
+        'total_calls_b': total_calls_b,
+        'total_calls': total_calls,
+        'monthly_sl_a': round(weighted_sl_a, 2),
+        'monthly_sl_b': round(weighted_sl_b, 2),
+        'overall_sl': round(overall_sl, 2),
+        'target_met': overall_sl >= CONFIG['target_sl'] * 100
+    }
+
+
+# ============================================================================
+# BÖLÜM 5: VARDİYA YÖNETİMİ
+# ============================================================================
+
+def load_shifts_from_excel(excel_path):
+    """Vardiya Excel'den oku"""
+    df = pd.read_excel(excel_path)
+    
+    required = ['shift', 'start', 'end']
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"❌ Eksik kolonlar: {missing}")
+    
+    shifts = []
+    for _, row in df.iterrows():
+        shifts.append({
+            'name': str(row['shift']),
+            'start': str(row['start']) if not hasattr(row['start'], 'strftime') else row['start'].strftime('%H:%M'),
+            'end': str(row['end']) if not hasattr(row['end'], 'strftime') else row['end'].strftime('%H:%M'),
+            'company': str(row.get('company', ''))
+        })
+    
+    return shifts
+
+
 def time_to_minutes(time_str):
+    """'07:30' → 450 dakika"""
     if hasattr(time_str, 'strftime'):
         time_str = time_str.strftime('%H:%M')
     h, m = map(int, str(time_str).split(':'))
@@ -154,6 +281,7 @@ def time_to_minutes(time_str):
 
 
 def is_time_in_shift(time_str, shift_start, shift_end):
+    """Bir zaman vardiya içinde mi?"""
     time_min = time_to_minutes(time_str)
     start_min = time_to_minutes(shift_start)
     end_min = time_to_minutes(shift_end)
@@ -164,38 +292,20 @@ def is_time_in_shift(time_str, shift_start, shift_end):
         return start_min <= time_min < end_min
 
 
-# ============================================================================
-# BÖLÜM 2: VARDİYALARA AKILLI DAĞITIM (SADECE PEAK)
-# ============================================================================
-
-# Peak saat tanımları
-PEAK_HOURS = {
-    'start': 9,   # 09:00
-    'end': 18     # 18:00
-}
-
-
 def is_peak_hour(time_str):
-    """Bu saat peak saati mi?"""
+    """Peak saat mi?"""
     hour = int(time_str.split(':')[0])
-    return PEAK_HOURS['start'] <= hour < PEAK_HOURS['end']
+    return CONFIG['peak_hours']['start'] <= hour < CONFIG['peak_hours']['end']
 
 
 def is_peak_shift(shift):
-    """Bu vardiya peak saatlerde mi başlıyor?"""
+    """Peak vardiya mı?"""
     shift_start_hour = int(shift['start'].split(':')[0])
-    return PEAK_HOURS['start'] <= shift_start_hour < PEAK_HOURS['end']
+    return CONFIG['peak_hours']['start'] <= shift_start_hour < CONFIG['peak_hours']['end']
 
 
-def distribute_by_peak_priority(interval_df, shifts):
-    """
-    PEAK ÖNCELİKLİ DAĞITIM
-    
-    Mantık:
-    - Peak saatte: Peak vardiyalara %50 daha fazla ağırlık
-    - Peak dışı saatte: Tüm vardiyalara eşit
-    - Gerektiği kadar agent, sıfır olanlar kaydedilmez
-    """
+def distribute_to_shifts(interval_df, shifts):
+    """Vardiyalara peak öncelikli dağıt"""
     results = []
     
     for idx, row in interval_df.iterrows():
@@ -208,17 +318,12 @@ def distribute_by_peak_priority(interval_df, shifts):
         
         is_peak = is_peak_hour(time)
         
-        # Bu saatte çalışan vardiyalar
+        # Çalışan vardiyalar
         working_shifts = []
         for shift in shifts:
             if is_time_in_shift(time, shift['start'], shift['end']):
                 is_peak_shift_flag = is_peak_shift(shift)
-                
-                # Ağırlık: Peak saatte + Peak vardiya = 1.5, diğerleri 1.0
-                if is_peak and is_peak_shift_flag:
-                    weight = 1.5
-                else:
-                    weight = 1.0
+                weight = 1.5 if (is_peak and is_peak_shift_flag) else 1.0
                 
                 working_shifts.append({
                     'name': shift['name'],
@@ -234,15 +339,13 @@ def distribute_by_peak_priority(interval_df, shifts):
         distribution = {}
         for ws in working_shifts:
             ratio = ws['weight'] / total_weight
-            agents = total_needed * ratio
-            distribution[ws['name']] = agents
+            distribution[ws['name']] = total_needed * ratio
         
         # Tam sayıya yuvarla
         current_total = sum(math.floor(v) for v in distribution.values())
         needed_diff = total_needed - current_total
         
         if needed_diff > 0:
-            # En yüksek ondalık kısma sahip olanlara 1'er ekle
             decimals = {k: v - math.floor(v) for k, v in distribution.items()}
             sorted_shifts = sorted(decimals.items(), key=lambda x: x[1], reverse=True)
             
@@ -250,7 +353,7 @@ def distribute_by_peak_priority(interval_df, shifts):
                 shift_name = sorted_shifts[i % len(sorted_shifts)][0]
                 distribution[shift_name] += 1
         
-        # Sonuçları kaydet (sadece agent > 0 olanlar)
+        # Kaydet
         for shift_name, agents in distribution.items():
             final_agents = math.floor(agents)
             if final_agents > 0:
@@ -258,15 +361,14 @@ def distribute_by_peak_priority(interval_df, shifts):
                     'date': date,
                     'time': time,
                     'shift': shift_name,
-                    'agents_needed': final_agents,
-                    'is_peak': is_peak
+                    'agents_needed': final_agents
                 })
     
     return pd.DataFrame(results)
 
 
 def aggregate_shifts(distribution_df, shifts):
-    """Her vardiya için MAX agent sayısı"""
+    """Vardiya bazlı MAX agent"""
     shift_results = []
     
     for date in sorted(distribution_df['date'].unique()):
@@ -277,51 +379,17 @@ def aggregate_shifts(distribution_df, shifts):
             
             if len(shift_data) > 0:
                 max_agents = math.ceil(shift_data['agents_needed'].max())
-            else:
-                max_agents = 0
-            
-            if max_agents > 0:
+                
                 shift_results.append({
                     'date': date,
                     'shift': shift['name'],
                     'start': shift['start'],
                     'end': shift['end'],
+                    'company': shift.get('company', ''),
                     'agents': max_agents
                 })
     
     return pd.DataFrame(shift_results)
-
-
-def verify_coverage(interval_df, vardiya_df, shifts):
-    """Doğrulama"""
-    verify_results = []
-    
-    for idx, row in interval_df.iterrows():
-        date = row['date']
-        time = row['time']
-        needed = row['total_agents']
-        
-        if needed == 0:
-            continue
-        
-        date_shifts = vardiya_df[vardiya_df['date'] == date]
-        
-        total_available = 0
-        for _, shift_row in date_shifts.iterrows():
-            shift_info = next((s for s in shifts if s['name'] == shift_row['shift']), None)
-            if shift_info and is_time_in_shift(time, shift_info['start'], shift_info['end']):
-                total_available += shift_row['agents']
-        
-        verify_results.append({
-            'date': date,
-            'time': time,
-            'needed': needed,
-            'available': total_available,
-            'sufficient': total_available >= needed,
-            'diff': total_available - needed
-        })
-    
-    return pd.DataFrame(verify_results)
 
 
 # ============================================================================
@@ -331,213 +399,75 @@ def verify_coverage(interval_df, vardiya_df, shifts):
 def calculate_complete_planning(df, shift_excel):
     """
     Komple kapasite planlaması
-    
-    Parameters:
-    - df: Çağrı tahmini (date, time, queue_a, queue_b)
-    - shift_excel: Vardiya Excel dosyası yolu (ZORUNLU)
+    ASA + SL kontrollü
     """
     
-    print("=" * 70)
-    print("KOMPLE KAPASİTE PLANLAMA - V2")
-    print("=" * 70)
+    print("=" * 80)
+    print("KAPASİTE PLANLAMA SİSTEMİ - V3 (ASA + SL)")
+    print("=" * 80)
+    print(f"\n⚙️ Konfigürasyon:")
+    print(f"   İnterval: {CONFIG['interval_minutes']} dakika")
+    print(f"   AHT: {CONFIG['aht']} saniye")
+    print(f"   Hedef ASA: ≤ {CONFIG['target_asa']} saniye")
+    print(f"   Hedef SL: ≥ %{CONFIG['target_sl']*100} ({CONFIG['target_seconds']} sn içinde)")
+    print(f"   Peak saatler: {CONFIG['peak_hours']['start']}:00 - {CONFIG['peak_hours']['end']}:00")
     
-    # Vardiyaları yükle
+    # Vardiyalar
     print(f"\n📂 Vardiyalar yükleniyor: {shift_excel}")
     shifts = load_shifts_from_excel(shift_excel)
+    print(f"✅ {len(shifts)} vardiya yüklendi")
     
-    # BÖLÜM 1: Interval bazlı ihtiyaç
-    print("\n⚙️ BÖLÜM 1: Interval bazlı agent ihtiyacı hesaplanıyor...")
-    interval_df = calculate_interval_requirements(df)
+    # BÖLÜM 1: Interval ihtiyaç
+    print("\n⚙️ BÖLÜM 1: Interval bazlı agent hesaplama...")
+    interval_df = calculate_interval_requirements(df, CONFIG)
     print(f"✅ {len(interval_df)} interval hesaplandı")
-    print(f"   Peak: {interval_df['total_agents'].max()} agent")
+    print(f"   Peak agent: {interval_df['total_agents'].max()}")
     
-    # BÖLÜM 2: Vardiyalara dağıt (PEAK ÖNCELİKLİ)
-    print("\n⚙️ BÖLÜM 2: Vardiyalara PEAK ÖNCELİKLİ dağıtım yapılıyor...")
-    print(f"   Peak saatler: {PEAK_HOURS['start']}:00 - {PEAK_HOURS['end']}:00")
-    distribution_df = distribute_by_peak_priority(interval_df, shifts)
+    # BÖLÜM 2: Aylık SL kontrol
+    print("\n⚙️ BÖLÜM 2: Aylık Service Level kontrolü...")
+    monthly_sl = calculate_monthly_sl(interval_df)
+    print(f"✅ Aylık SL: %{monthly_sl['overall_sl']:.1f}")
+    print(f"   A Kuyruğu: %{monthly_sl['monthly_sl_a']:.1f}")
+    print(f"   B Kuyruğu: %{monthly_sl['monthly_sl_b']:.1f}")
+    print(f"   Hedef (%{CONFIG['target_sl']*100}): {'✅ KARŞILANDI' if monthly_sl['target_met'] else '❌ KARŞILANMADI'}")
     
-    print("\n⚙️ BÖLÜM 3: Vardiya bazlı toplama yapılıyor...")
+    # BÖLÜM 3: Vardiya dağıt
+    print("\n⚙️ BÖLÜM 3: Vardiyalara dağıtım...")
+    distribution_df = distribute_to_shifts(interval_df, shifts)
+    
     vardiya_df = aggregate_shifts(distribution_df, shifts)
     print(f"✅ {len(vardiya_df)} vardiya-gün kombinasyonu")
     
-    # BÖLÜM 3: Doğrulama
-    print("\n⚙️ BÖLÜM 4: Doğrulama yapılıyor...")
-    verify_df = verify_coverage(interval_df, vardiya_df, shifts)
-    
-    sufficient_count = verify_df['sufficient'].sum()
-    total_count = len(verify_df)
-    
-    print(f"✅ {sufficient_count} / {total_count} interval yeterli")
-    
-    insufficient = verify_df[~verify_df['sufficient']]
-    if len(insufficient) > 0:
-        print(f"⚠️ {len(insufficient)} interval YETERSİZ!")
-        print("\nİlk 5 yetersiz interval:")
-        print(insufficient[['date', 'time', 'needed', 'available', 'diff']].head(5))
-    
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("✅ TAMAMLANDI!")
-    print("=" * 70)
+    print("=" * 80)
     
-    return interval_df, vardiya_df, verify_df
+    return interval_df, vardiya_df, monthly_sl
 
 
 # ============================================================================
 # KULLANIM
 # ============================================================================
 
-# ============================================================================
-# KULLANIM ve TEST
-# ============================================================================
-
-def load_call_forecast_from_sql(connection_string, query=None):
-    """
-    SQL'den çağrı tahmini oku
-    
-    Parameters:
-    - connection_string: SQL bağlantı string'i
-    - query: SQL sorgusu (opsiyonel, varsayılan sorgu var)
-    
-    Örnek connection_string:
-    - "mssql+pyodbc://user:pass@server/database?driver=ODBC+Driver+17+for+SQL+Server"
-    - "postgresql://user:pass@localhost/database"
-    """
-    from sqlalchemy import create_engine
-    
-    if query is None:
-        query = """
-        SELECT 
-            date,
-            time,
-            queue_a,
-            queue_b
-        FROM call_forecast
-        WHERE date >= DATEADD(day, 0, GETDATE())
-        ORDER BY date, time
-        """
-    
-    engine = create_engine(connection_string)
-    df = pd.read_sql(query, engine)
-    
-    print(f"✅ SQL'den {len(df)} satır veri okundu")
-    return df
-
-
-def create_sample_data():
-    """Örnek test verisi oluştur"""
-    dates = pd.date_range('2025-01-15', '2025-01-16', freq='D')
-    times = pd.date_range('00:00', '23:45', freq='15min').strftime('%H:%M')
-    
-    rows = []
-    for date in dates:
-        for i, time in enumerate(times):
-            # Gün içi pattern
-            hour = int(time.split(':')[0])
-            
-            if 7 <= hour < 12:  # Sabah
-                calls_a = 30 + (hour - 7) * 5
-                calls_b = 15 + (hour - 7) * 3
-            elif 12 <= hour < 18:  # Öğle-Akşam (PEAK)
-                calls_a = 50 + (i % 4) * 5
-                calls_b = 25 + (i % 4) * 3
-            elif 18 <= hour < 24:  # Akşam
-                calls_a = 40 - (hour - 18) * 3
-                calls_b = 20 - (hour - 18) * 2
-            else:  # Gece
-                calls_a = 10
-                calls_b = 5
-            
-            rows.append({
-                'date': date.strftime('%Y-%m-%d'),
-                'time': time,
-                'queue_a': calls_a,
-                'queue_b': calls_b
-            })
-    
-    return pd.DataFrame(rows)
-
-
 if __name__ == '__main__':
-    
     print("""
-╔══════════════════════════════════════════════════════════════════╗
-║  KOMPLE KAPASİTE PLANLAMA - V2                                   ║
-╚══════════════════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════════╗
+║  KAPASİTE PLANLAMA - V3 (ASA + SERVICE LEVEL)                 ║
+╚════════════════════════════════════════════════════════════════╝
 
 KULLANIM:
 
-# 1. Vardiya Excel'i hazırla (vardiyalar.xlsx)
-#    shift | start | end   | company
-#    V1    | 07:00 | 16:00 | A21
-#    V2    | 08:00 | 17:00 | A21
-
-# 2. SQL'den çağrı tahmini oku
-df = load_call_forecast_from_sql(connection_string)
-
-# VEYA Excel'den oku
+# Veri oku (SQL veya Excel)
 df = pd.read_excel('cagri_tahminleri.xlsx')
+# Kolonlar: date, time, queue_a, queue_b
 
-# 3. Hesapla
-interval_df, vardiya_df, verify_df = calculate_complete_planning(
-    df, 
+# Hesapla
+interval_df, vardiya_df, monthly_sl = calculate_complete_planning(
+    df,
     shift_excel='vardiyalar.xlsx'
 )
 
-# 4. Kaydet
-vardiya_df.to_excel('vardiya_plani.xlsx', index=False)
-
-═══════════════════════════════════════════════════════════════════
+# Kaydet
+interval_df.to_excel('sonuc_interval.xlsx', index=False)
+vardiya_df.to_excel('sonuc_vardiya.xlsx', index=False)
 """)
-    
-    print("\n" + "=" * 70)
-    print("ÖRNEK VERİ İLE TEST")
-    print("=" * 70)
-    
-    # Örnek veri oluştur
-    print("\n📊 Örnek 2 günlük veri oluşturuluyor...")
-    df = create_sample_data()
-    print(f"✅ {len(df)} satır veri hazır")
-    
-    # Örnek vardiya Excel'i oluştur
-    print("\n📂 Örnek vardiya Excel'i oluşturuluyor...")
-    sample_shifts = pd.DataFrame([
-        {'shift': 'V1', 'start': '07:00', 'end': '16:00', 'company': 'A21'},
-        {'shift': 'V2', 'start': '08:00', 'end': '17:00', 'company': 'A21'},
-        {'shift': 'V3', 'start': '09:00', 'end': '18:00', 'company': 'A21'},
-        {'shift': 'V10', 'start': '08:00', 'end': '17:30', 'company': 'B21'},
-        {'shift': 'V11', 'start': '09:00', 'end': '18:30', 'company': 'B21'},
-    ])
-    sample_shifts.to_excel('_test_vardiyalar.xlsx', index=False)
-    print("✅ _test_vardiyalar.xlsx oluşturuldu")
-    
-    # Hesapla
-    print("\n" + "=" * 70)
-    interval_df, vardiya_df, verify_df = calculate_complete_planning(
-        df, 
-        shift_excel='_test_vardiyalar.xlsx'
-    )
-    
-    # Sonuçları göster
-    print("\n" + "=" * 70)
-    print("📊 SONUÇLAR")
-    print("=" * 70)
-    
-    print("\n1️⃣ VARDİYA PLANI:")
-    print(vardiya_df.to_string(index=False))
-    
-    print("\n2️⃣ DOĞRULAMA (İlk 10):")
-    print(verify_df[['date', 'time', 'needed', 'available', 'sufficient', 'diff']].head(10).to_string(index=False))
-    
-    # Özet
-    print("\n" + "=" * 70)
-    print("📈 ÖZET")
-    print("=" * 70)
-    print(f"Peak agent ihtiyacı: {interval_df['total_agents'].max()}")
-    print(f"Toplam vardiya-gün: {len(vardiya_df)}")
-    print(f"Yeterli interval: {verify_df['sufficient'].sum()} / {len(verify_df)}")
-    
-    insufficient = verify_df[~verify_df['sufficient']]
-    if len(insufficient) > 0:
-        print(f"\n⚠️ YETERSİZ: {len(insufficient)} interval")
-    else:
-        print("\n✅ TÜM İNTERVALLER YETERLİ!")
