@@ -1,6 +1,7 @@
 """
-KOMPLE KAPASİTE PLANLAMA SİSTEMİ - V3
-ASA + Service Level İkili Kontrolü
+KOMPLE KAPASİTE PLANLAMA SİSTEMİ - FINAL
+ASA + Service Level (Saatlik ASA + Günlük Takip + Aylık Hedef)
+Peak Öncelikli Vardiya Dağıtımı
 """
 import pandas as pd
 import math
@@ -52,7 +53,7 @@ def calculate_asa(agents, traffic, aht):
 
 
 def calculate_service_level(agents, traffic, aht, target_seconds):
-    """Service Level hesapla - %80 çağrı X saniye içinde"""
+    """Service Level hesapla - %X çağrı Y saniye içinde"""
     if agents <= traffic or agents == 0:
         return 0.0
     
@@ -116,12 +117,10 @@ def find_agents_for_sl(calls, interval_min, aht, target_sl, target_seconds, tole
         sl = calculate_service_level(agents, traffic, aht, target_seconds)
         diff = abs(sl - target_sl)
         
-        # Tolerans içinde ve daha yakınsa
         if diff <= tolerance and diff < best_diff:
             best_agent = agents
             best_diff = diff
             
-            # Tam hedefi bulduysak dur
             if diff < 0.001:
                 break
     
@@ -136,7 +135,6 @@ def find_optimal_agents(calls, config):
     if calls == 0:
         return 0, 0, 0, 0, 0
     
-    # ASA için agent
     agents_asa = find_agents_for_asa(
         calls, 
         config['interval_minutes'],
@@ -144,7 +142,6 @@ def find_optimal_agents(calls, config):
         config['target_asa']
     )
     
-    # SL için agent
     agents_sl = find_agents_for_sl(
         calls,
         config['interval_minutes'],
@@ -154,13 +151,9 @@ def find_optimal_agents(calls, config):
         config['sl_tolerance']
     )
     
-    # İkisinden büyük olanı seç
     agents_raw = max(agents_asa, agents_sl)
-    
-    # Shrinkage ekle
     agents_final = math.ceil(agents_raw / (1 - config['shrinkage']))
     
-    # Metrikleri hesapla
     traffic = calculate_traffic(calls, config['interval_minutes'], config['aht'])
     final_asa = calculate_asa(agents_raw, traffic, config['aht'])
     final_sl = calculate_service_level(agents_raw, traffic, config['aht'], config['target_seconds'])
@@ -173,17 +166,13 @@ def find_optimal_agents(calls, config):
 # ============================================================================
 
 def calculate_interval_requirements(df, config):
-    """
-    Her interval için agent ihtiyacını hesapla
-    Hem ASA hem SL kontrolü ile
-    """
+    """Her interval için agent ihtiyacını hesapla (ASA + SL)"""
     results = []
     
     for idx, row in df.iterrows():
         date = row['date']
         time = row['time']
         
-        # Time object kontrolü
         if hasattr(time, 'strftime'):
             time = time.strftime('%H:%M')
         elif not isinstance(time, str):
@@ -192,10 +181,7 @@ def calculate_interval_requirements(df, config):
         calls_a = row['queue_a']
         calls_b = row['queue_b']
         
-        # A kuyruğu için
         agents_a, asa_agents_a, sl_agents_a, final_asa_a, final_sl_a = find_optimal_agents(calls_a, config)
-        
-        # B kuyruğu için
         agents_b, asa_agents_b, sl_agents_b, final_asa_b, final_sl_b = find_optimal_agents(calls_b, config)
         
         results.append({
@@ -218,14 +204,11 @@ def calculate_interval_requirements(df, config):
 
 
 # ============================================================================
-# BÖLÜM 4: GÜNLÜK ve AYLIK SERVICE LEVEL KONTROLÜ
+# BÖLÜM 4: GÜNLÜK ve AYLIK SERVICE LEVEL
 # ============================================================================
 
 def calculate_daily_sl(interval_df):
-    """
-    Günlük Service Level hesapla
-    Her gün için toplam SL (bilgi amaçlı, zorunlu değil)
-    """
+    """Günlük Service Level (bilgi amaçlı)"""
     daily_results = []
     
     for date in sorted(interval_df['date'].unique()):
@@ -234,7 +217,6 @@ def calculate_daily_sl(interval_df):
         total_calls_a = day_data['calls_a'].sum()
         total_calls_b = day_data['calls_b'].sum()
         
-        # Ağırlıklı ortalama SL
         weighted_sl_a = (day_data['calls_a'] * day_data['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
         weighted_sl_b = (day_data['calls_b'] * day_data['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
         
@@ -246,22 +228,17 @@ def calculate_daily_sl(interval_df):
             'total_calls': int(total_calls),
             'daily_sl_a': round(weighted_sl_a, 2),
             'daily_sl_b': round(weighted_sl_b, 2),
-            'daily_sl_overall': round(daily_sl, 2),
-            'info': 'Günlük takip (zorunlu değil)'
+            'daily_sl_overall': round(daily_sl, 2)
         })
     
     return pd.DataFrame(daily_results)
 
 
 def calculate_monthly_sl(interval_df):
-    """
-    Aylık toplam Service Level hesapla
-    ZORUNLU HEDEF: Ay toplamında %80
-    """
+    """Aylık Service Level (ZORUNLU HEDEF)"""
     total_calls_a = interval_df['calls_a'].sum()
     total_calls_b = interval_df['calls_b'].sum()
     
-    # Ağırlıklı ortalama SL
     weighted_sl_a = (interval_df['calls_a'] * interval_df['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
     weighted_sl_b = (interval_df['calls_b'] * interval_df['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
     
@@ -318,7 +295,7 @@ def is_time_in_shift(time_str, shift_start, shift_end):
     start_min = time_to_minutes(shift_start)
     end_min = time_to_minutes(shift_end)
     
-    if end_min <= start_min:  # Gece vardiyası
+    if end_min <= start_min:
         return time_min >= start_min or time_min < end_min
     else:
         return start_min <= time_min < end_min
@@ -350,7 +327,6 @@ def distribute_to_shifts(interval_df, shifts):
         
         is_peak = is_peak_hour(time)
         
-        # Çalışan vardiyalar
         working_shifts = []
         for shift in shifts:
             if is_time_in_shift(time, shift['start'], shift['end']):
@@ -365,7 +341,6 @@ def distribute_to_shifts(interval_df, shifts):
         if len(working_shifts) == 0:
             continue
         
-        # Ağırlıklı dağıt
         total_weight = sum(ws['weight'] for ws in working_shifts)
         
         distribution = {}
@@ -373,7 +348,6 @@ def distribute_to_shifts(interval_df, shifts):
             ratio = ws['weight'] / total_weight
             distribution[ws['name']] = total_needed * ratio
         
-        # Tam sayıya yuvarla
         current_total = sum(math.floor(v) for v in distribution.values())
         needed_diff = total_needed - current_total
         
@@ -385,7 +359,6 @@ def distribute_to_shifts(interval_df, shifts):
                 shift_name = sorted_shifts[i % len(sorted_shifts)][0]
                 distribution[shift_name] += 1
         
-        # Kaydet
         for shift_name, agents in distribution.items():
             final_agents = math.floor(agents)
             if final_agents > 0:
@@ -431,57 +404,46 @@ def aggregate_shifts(distribution_df, shifts):
 def calculate_complete_planning(df, shift_excel):
     """
     Komple kapasite planlaması
-    ASA + SL kontrollü (Günlük + Aylık)
+    ASA + SL (Saatlik ASA + Günlük Takip + Aylık Hedef)
     """
     
     print("=" * 80)
-    print("KAPASİTE PLANLAMA SİSTEMİ - V3 (ASA + GÜNLÜK/AYLIK SL)")
+    print("KAPASİTE PLANLAMA SİSTEMİ - FINAL")
     print("=" * 80)
-    print(f"\n⚙️ Konfigürasyon:")
-    print(f"   İnterval: {CONFIG['interval_minutes']} dakika")
-    print(f"   Her saat: ASA ≤ {CONFIG['target_asa']} saniye (müşteri deneyimi)")
-    print(f"   Her gün: SL ≥ %{CONFIG['target_sl']*100} (günlük hedef)")
-    print(f"   Ay toplam: SL ≥ %{CONFIG['target_sl']*100} (aylık hedef)")
+    print(f"\n⚙️ Hedefler:")
+    print(f"   Saatlik: ASA ≤ {CONFIG['target_asa']} saniye (müşteri deneyimi)")
+    print(f"   Günlük: SL takip (%78-82 normal, telafi edilir)")
+    print(f"   Aylık: SL ≥ %{CONFIG['target_sl']*100} (ZORUNLU)")
     
-    # Vardiyalar
-    print(f"\n📂 Vardiyalar yükleniyor: {shift_excel}")
+    print(f"\n📂 Vardiyalar: {shift_excel}")
     shifts = load_shifts_from_excel(shift_excel)
     print(f"✅ {len(shifts)} vardiya yüklendi")
     
-    # BÖLÜM 1: Interval ihtiyaç
-    print("\n⚙️ BÖLÜM 1: Interval bazlı agent hesaplama...")
+    print("\n⚙️ BÖLÜM 1: Interval bazlı hesaplama...")
     interval_df = calculate_interval_requirements(df, CONFIG)
-    print(f"✅ {len(interval_df)} interval hesaplandı")
+    print(f"✅ {len(interval_df)} interval")
     print(f"   Peak agent: {interval_df['total_agents'].max()}")
     
-    # BÖLÜM 2: Günlük SL (bilgi amaçlı)
-    print("\n⚙️ BÖLÜM 2: Günlük Service Level (takip)...")
+    print("\n⚙️ BÖLÜM 2: Günlük SL (takip)...")
     daily_sl_df = calculate_daily_sl(interval_df)
     
-    avg_daily_sl = daily_sl_df['daily_sl_overall'].mean()
-    min_daily_sl = daily_sl_df['daily_sl_overall'].min()
-    max_daily_sl = daily_sl_df['daily_sl_overall'].max()
+    avg_daily = daily_sl_df['daily_sl_overall'].mean()
+    min_daily = daily_sl_df['daily_sl_overall'].min()
+    max_daily = daily_sl_df['daily_sl_overall'].max()
     
     print(f"✅ Günlük SL dağılımı:")
-    print(f"   Ortalama: %{avg_daily_sl:.1f}")
-    print(f"   Min: %{min_daily_sl:.1f} (En düşük gün)")
-    print(f"   Max: %{max_daily_sl:.1f} (En yüksek gün)")
-    print(f"   → Günlük %78-82 arası normal (telafi edilir)")
+    print(f"   Ortalama: %{avg_daily:.1f}")
+    print(f"   Min: %{min_daily:.1f} | Max: %{max_daily:.1f}")
     
-    # BÖLÜM 3: Aylık SL (ZORUNLU)
-    print("\n⚙️ BÖLÜM 3: Aylık Service Level (ZORUNLU HEDEF)...")
+    print("\n⚙️ BÖLÜM 3: Aylık SL (ZORUNLU)...")
     monthly_sl = calculate_monthly_sl(interval_df)
     print(f"✅ Aylık SL: %{monthly_sl['overall_sl']:.1f}")
-    print(f"   A Kuyruğu: %{monthly_sl['monthly_sl_a']:.1f}")
-    print(f"   B Kuyruğu: %{monthly_sl['monthly_sl_b']:.1f}")
-    print(f"   Hedef (%{CONFIG['target_sl']*100}): {'✅ KARŞILANDI' if monthly_sl['target_met'] else '❌ KARŞILANMADI'}")
+    print(f"   {'✅ KARŞILANDI' if monthly_sl['target_met'] else '❌ KARŞILANMADI'}")
     
-    # BÖLÜM 4: Vardiya dağıt
-    print("\n⚙️ BÖLÜM 4: Vardiyalara dağıtım...")
+    print("\n⚙️ BÖLÜM 4: Vardiya dağıtımı...")
     distribution_df = distribute_to_shifts(interval_df, shifts)
-    
     vardiya_df = aggregate_shifts(distribution_df, shifts)
-    print(f"✅ {len(vardiya_df)} vardiya-gün kombinasyonu")
+    print(f"✅ {len(vardiya_df)} vardiya-gün")
     
     print("\n" + "=" * 80)
     print("✅ TAMAMLANDI!")
@@ -497,14 +459,18 @@ def calculate_complete_planning(df, shift_excel):
 if __name__ == '__main__':
     print("""
 ╔════════════════════════════════════════════════════════════════╗
-║  KAPASİTE PLANLAMA - V3 (ASA + SERVICE LEVEL)                 ║
+║  KAPASİTE PLANLAMA SİSTEMİ - FINAL                            ║
 ╚════════════════════════════════════════════════════════════════╝
 
 KULLANIM:
 
-# Veri oku (SQL veya Excel)
+# SQL'den oku
+import sqlalchemy
+engine = sqlalchemy.create_engine('connection_string')
+df = pd.read_sql('SELECT date, time, queue_a, queue_b FROM forecast', engine)
+
+# VEYA Excel'den oku
 df = pd.read_excel('cagri_tahminleri.xlsx')
-# Kolonlar: date, time, queue_a, queue_b
 
 # Hesapla
 interval_df, vardiya_df, daily_sl_df, monthly_sl = calculate_complete_planning(
@@ -516,4 +482,6 @@ interval_df, vardiya_df, daily_sl_df, monthly_sl = calculate_complete_planning(
 interval_df.to_excel('sonuc_interval.xlsx', index=False)
 vardiya_df.to_excel('sonuc_vardiya.xlsx', index=False)
 daily_sl_df.to_excel('sonuc_gunluk_sl.xlsx', index=False)
+
+print(f"Aylık SL: %{monthly_sl['overall_sl']}")
 """)
