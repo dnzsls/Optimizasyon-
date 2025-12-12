@@ -1,360 +1,626 @@
-# “””
-CALL CENTER WORKFORCE MANAGEMENT - UPDATED VERSION
+“””
+KOMPLE KAPASİTE PLANLAMA SİSTEMİ - V3
+ASA Bazlı Agent Hesaplama + pyworkforce Vardiya Optimizasyonu
 
-Güncellemeler:
+Kurulum:
+pip install pyworkforce pandas openpyxl
 
-1. ErlangC hesaplamaları aynı kaldı
-1. Eski peak-based vardiya hesaplaması KALDIRILDI
-1. MinRequiredResources (Linear Programming) EKLENDİ
-   “””
+Özellikler:
+- Erlang C ile ASA bazlı agent ihtiyacı
+- pyworkforce MinRequiredResources ile vardiya optimizasyonu
+- Şirket bazlı vardiya birleştirme
+- Aylık SL ve Compliance takibi
+“””
 
-import numpy as np
 import pandas as pd
-from scipy.optimize import linprog
-from scipy.special import factorial
 import math
+from pyworkforce.scheduling import MinRequiredResources
 
 # ============================================================================
 
-# ERLANG C FUNCTIONS (Aynı)
+# KONFIGURASYON
 
 # ============================================================================
 
-def erlang_c(agents, traffic_intensity):
-“”“Erlang C formülü”””
-if agents <= traffic_intensity:
+CONFIG = {
+‘aht’: 188,              # Average Handle Time - saniye
+‘target_asa’: 30,        # Hedef ASA - saniye
+‘target_sl’: 0.80,       # Hedef Service Level - %80 (aylık kontrol)
+‘target_seconds’: 30,    # SL için hedef süre - saniye
+‘shrinkage’: 0.10,       # Mola/izin payı - %10
+‘interval_minutes’: 60,  # İnterval - dakika
+‘compliance’: {
+‘min_sl’: 75,        # Compliance alt sınır %
+‘max_sl’: 85         # Compliance üst sınır %
+},
+‘optimization’: {
+‘max_period_concurrency’: 1500,   # Saatte max agent
+‘max_shift_concurrency’: 800,     # Vardiyada max agent
+‘max_search_time’: 300.0          # Max çözüm süresi (saniye)
+}
+}
+
+# ============================================================================
+
+# BÖLÜM 1: ERLANG C TEMELLERİ
+
+# ============================================================================
+
+def erlang_c(agents, traffic):
+“”“Erlang C: Kuyrukta bekleme olasılığı”””
+if agents <= traffic or agents == 0:
 return 1.0
 
 ```
-numerator = (traffic_intensity ** agents / factorial(agents)) * \
-            (agents / (agents - traffic_intensity))
+erlang_b = traffic / agents
+for i in range(2, int(agents) + 1):
+    erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
 
-denominator = sum([traffic_intensity ** k / factorial(k) for k in range(agents)])
-denominator += numerator
-
-return numerator / denominator
+erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
+return min(erlang_c_val, 1.0)
 ```
 
-def calculate_asa(agents, traffic_intensity, aht_minutes):
-“”“Average Speed of Answer”””
-if agents <= traffic_intensity:
-return float(‘inf’)
+def calculate_asa(agents, traffic, aht):
+“”“ASA (Average Speed to Answer) hesapla - saniye”””
+if agents <= traffic or agents == 0:
+return 999
 
 ```
-pw = erlang_c(agents, traffic_intensity)
-return (pw * aht_minutes) / (agents - traffic_intensity)
+ec = erlang_c(agents, traffic)
+asa = (ec * (aht / 60)) / (agents - traffic) * 60
+return asa
 ```
 
-def calculate_service_level(agents, traffic_intensity, aht_minutes, target_answer_time_seconds):
-“”“Service Level”””
-if agents <= traffic_intensity:
+def calculate_service_level(agents, traffic, aht, target_seconds):
+“”“Service Level hesapla - %X çağrı Y saniye içinde”””
+if agents <= traffic or agents == 0:
 return 0.0
 
 ```
-pw = erlang_c(agents, traffic_intensity)
-target_minutes = target_answer_time_seconds / 60
-exponent = -(agents - traffic_intensity) * target_minutes / aht_minutes
-
-return max(0.0, min(1.0, 1 - (pw * math.exp(exponent))))
+ec = erlang_c(agents, traffic)
+exp_term = math.exp(-(agents - traffic) * (target_seconds / aht))
+sl = 1 - (ec * exp_term)
+return max(0, min(1, sl))
 ```
 
-def find_required_agents_for_asa(
-hourly_calls,
-aht_minutes,
-target_asa_seconds=30,
-shrinkage=0.30,
-max_iterations=200
-):
-“”“ASA hedefine göre gerekli ajan sayısını bul”””
-if hourly_calls == 0:
-return {
-‘raw_agents’: 0,
-‘adjusted_agents’: 0,
-‘asa_seconds’: 0,
-‘service_level_80_20’: 1.0,
-‘occupancy’: 0,
-‘traffic_intensity’: 0
-}
+def calculate_traffic(calls, interval_min, aht):
+“”“Traffic (Erlang) hesapla”””
+if calls == 0:
+return 0
+return (calls * (aht / 60)) / interval_min
+
+# ============================================================================
+
+# BÖLÜM 2: AGENT SAYISI BULMA (SADECE ASA BAZLI)
+
+# ============================================================================
+
+def find_agents_for_asa(calls, interval_min, aht, target_asa):
+“”“ASA hedefi için gereken agent sayısı”””
+if calls == 0:
+return 0
 
 ```
-traffic_intensity = (hourly_calls * aht_minutes) / 60
-min_agents = max(1, int(np.ceil(traffic_intensity)) + 1)
-target_asa_minutes = target_asa_seconds / 60
+traffic = calculate_traffic(calls, interval_min, aht)
+if traffic == 0:
+    return 0
 
-best_agents = min_agents
-for agents in range(min_agents, min_agents + max_iterations):
-    asa = calculate_asa(agents, traffic_intensity, aht_minutes)
-    if asa <= target_asa_minutes:
-        best_agents = agents
-        break
+min_agents = math.ceil(traffic)
+max_agents = math.ceil(traffic * 2) + 5
 
-final_asa = calculate_asa(best_agents, traffic_intensity, aht_minutes)
-final_sl = calculate_service_level(best_agents, traffic_intensity, aht_minutes, 20)
-occupancy = traffic_intensity / best_agents if best_agents > 0 else 0
-adjusted_agents = int(np.ceil(best_agents / (1 - shrinkage)))
+for agents in range(min_agents, max_agents + 1):
+    asa = calculate_asa(agents, traffic, aht)
+    if asa <= target_asa:
+        return agents
 
-return {
-    'raw_agents': best_agents,
-    'adjusted_agents': adjusted_agents,
-    'asa_seconds': final_asa * 60,
-    'service_level_80_20': final_sl,
-    'occupancy': occupancy,
-    'traffic_intensity': traffic_intensity
-}
+return max_agents
+```
+
+def find_optimal_agents(calls, config):
+“”“Sadece ASA bazlı agent hesabı”””
+if calls == 0:
+return 0, 0, 0
+
+```
+agents_raw = find_agents_for_asa(
+    calls, 
+    config['interval_minutes'],
+    config['aht'],
+    config['target_asa']
+)
+
+agents_final = math.ceil(agents_raw / (1 - config['shrinkage']))
+
+traffic = calculate_traffic(calls, config['interval_minutes'], config['aht'])
+final_asa = calculate_asa(agents_raw, traffic, config['aht'])
+final_sl = calculate_service_level(agents_raw, traffic, config['aht'], config['target_seconds'])
+
+return agents_final, final_asa, final_sl
 ```
 
 # ============================================================================
 
-# YENİ: MIN REQUIRED RESOURCES (Linear Programming)
+# BÖLÜM 3: INTERVAL BAZLI İHTİYAÇ
 
 # ============================================================================
 
-class MinRequiredResources:
-“””
-Linear Programming ile vardiya optimizasyonu
-“””
+def calculate_interval_requirements(df, config):
+“”“Her interval için agent ihtiyacını hesapla”””
+results = []
 
 ```
-def __init__(self, shifts_coverage, required_resources, shift_costs=None, max_shift_capacity=None):
-    self.shifts_coverage = shifts_coverage
-    self.required_resources = required_resources
-    self.shift_names = list(shifts_coverage.keys())
-    self.num_shifts = len(self.shift_names)
-    self.num_hours = len(required_resources)
+for idx, row in df.iterrows():
+    date = row['date']
+    time = row['time']
     
-    if shift_costs is None:
-        self.shift_costs = {shift: 1.0 for shift in self.shift_names}
-    else:
-        self.shift_costs = shift_costs
-        
-    self.max_shift_capacity = max_shift_capacity
-
-def solve(self):
-    """Linear Programming ile çöz"""
+    if hasattr(time, 'strftime'):
+        time = time.strftime('%H:%M')
+    elif not isinstance(time, str):
+        time = str(time)
     
-    # Objective: minimize toplam ajan (maliyet ağırlıklı)
-    c = [self.shift_costs[shift] for shift in self.shift_names]
+    calls_a = row['queue_a']
+    calls_b = row['queue_b']
     
-    # Constraints: Her saat için >= kısıtı
-    A_ub = []
-    b_ub = []
+    agents_a, final_asa_a, final_sl_a = find_optimal_agents(calls_a, config)
+    agents_b, final_asa_b, final_sl_b = find_optimal_agents(calls_b, config)
     
-    for hour in range(self.num_hours):
-        constraint_row = []
-        for shift in self.shift_names:
-            constraint_row.append(-self.shifts_coverage[shift][hour])
-        A_ub.append(constraint_row)
-        b_ub.append(-self.required_resources[hour])
-    
-    # Bounds
-    bounds = []
-    for shift in self.shift_names:
-        if self.max_shift_capacity and shift in self.max_shift_capacity:
-            bounds.append((0, self.max_shift_capacity[shift]))
-        else:
-            bounds.append((0, None))
-    
-    # Solve
-    result = linprog(c=c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs', options={'disp': False})
-    
-    if result.success:
-        shift_assignments = {}
-        for i, shift in enumerate(self.shift_names):
-            shift_assignments[shift] = np.ceil(result.x[i])
-        
-        hourly_coverage = self._calculate_hourly_coverage(shift_assignments)
-        hourly_difference = [hourly_coverage[h] - self.required_resources[h] for h in range(self.num_hours)]
-        
-        return {
-            'status': 'optimal',
-            'total_agents': sum(shift_assignments.values()),
-            'shift_assignments': shift_assignments,
-            'hourly_coverage': hourly_coverage,
-            'hourly_difference': hourly_difference,
-            'all_constraints_met': all(d >= 0 for d in hourly_difference)
-        }
-    else:
-        return {'status': 'infeasible', 'message': result.message}
-
-def _calculate_hourly_coverage(self, shift_assignments):
-    hourly_coverage = [0.0] * self.num_hours
-    for shift, agents in shift_assignments.items():
-        for hour in range(self.num_hours):
-            if self.shifts_coverage[shift][hour] == 1:
-                hourly_coverage[hour] += agents
-    return hourly_coverage
-```
-
-# ============================================================================
-
-# ANA WORKFLOW
-
-# ============================================================================
-
-def calculate_workforce_requirements(
-hourly_calls,
-aht_minutes,
-shifts_coverage,
-target_asa_seconds=30,
-shrinkage=0.30,
-shift_costs=None,
-max_shift_capacity=None,
-verbose=True
-):
-“””
-Ana workflow: ErlangC + Linear Programming
-“””
-
-```
-if verbose:
-    print("=" * 80)
-    print("CALL CENTER WORKFORCE MANAGEMENT")
-    print("=" * 80)
-
-# ADIM 1: ErlangC ile saatlik ihtiyaç
-if verbose:
-    print("\nADIM 1: ERLANG C HESAPLAMALARI")
-    print("-" * 80)
-
-hourly_requirements = []
-erlang_details = []
-
-for hour, calls in enumerate(hourly_calls):
-    result = find_required_agents_for_asa(
-        hourly_calls=calls,
-        aht_minutes=aht_minutes,
-        target_asa_seconds=target_asa_seconds,
-        shrinkage=shrinkage
-    )
-    
-    hourly_requirements.append(result['adjusted_agents'])
-    erlang_details.append({
-        'Hour': hour,
-        'Calls': calls,
-        'Raw_Agents': result['raw_agents'],
-        'Adjusted_Agents': result['adjusted_agents'],
-        'ASA_Seconds': round(result['asa_seconds'], 2),
-        'SL_80_20': round(result['service_level_80_20'], 4),
-        'Occupancy': round(result['occupancy'], 4)
+    results.append({
+        'date': date,
+        'time': time,
+        'calls_a': calls_a,
+        'calls_b': calls_b,
+        'agents_a': agents_a,
+        'agents_b': agents_b,
+        'total_agents': agents_a + agents_b,
+        'asa_a': round(final_asa_a, 1),
+        'sl_a': round(final_sl_a * 100, 1),
+        'asa_b': round(final_asa_b, 1),
+        'sl_b': round(final_sl_b * 100, 1)
     })
 
-erlang_df = pd.DataFrame(erlang_details)
-if verbose:
-    print(erlang_df.to_string(index=False))
-    print(f"\nSaatlik toplam: {sum(hourly_requirements)}")
+return pd.DataFrame(results)
+```
 
-# ADIM 2: Linear Programming ile vardiya optimizasyonu
-if verbose:
-    print("\n" + "=" * 80)
-    print("ADIM 2: LINEAR PROGRAMMING ILE VARDIYA OPTIMIZASYONU")
-    print("-" * 80)
+# ============================================================================
 
-solver = MinRequiredResources(
-    shifts_coverage=shifts_coverage,
-    required_resources=hourly_requirements,
-    shift_costs=shift_costs,
-    max_shift_capacity=max_shift_capacity
-)
+# BÖLÜM 4: GÜNLÜK, AYLIK SL ve COMPLIANCE
 
-solution = solver.solve()
+# ============================================================================
 
-if solution['status'] == 'optimal':
-    if verbose:
-        print(f"\nDurum: ✓ OPTIMAL")
-        print(f"Toplam Ajan: {int(solution['total_agents'])}")
-        print(f"Tüm Kısıtlar: ✓")
-        
-        print("\nVardiya Atamaları:")
-        for shift, agents in solution['shift_assignments'].items():
-            print(f"  {shift:20s}: {int(agents):4d} ajan")
+def calculate_daily_sl(interval_df):
+“”“Günlük Service Level”””
+daily_results = []
+
+```
+for date in sorted(interval_df['date'].unique()):
+    day_data = interval_df[interval_df['date'] == date]
     
-    comparison_data = []
-    for hour in range(24):
-        comparison_data.append({
-            'Hour': hour,
-            'Calls': int(hourly_calls[hour]),
-            'Required': int(hourly_requirements[hour]),
-            'Assigned': int(solution['hourly_coverage'][hour]),
-            'Diff': int(solution['hourly_difference'][hour])
-        })
+    total_calls_a = day_data['calls_a'].sum()
+    total_calls_b = day_data['calls_b'].sum()
     
-    comparison_df = pd.DataFrame(comparison_data)
-    if verbose:
-        print("\n" + "=" * 80)
-        print("SAATLIK KARŞILAŞTIRMA")
-        print("-" * 80)
-        print(comparison_df.to_string(index=False))
-else:
-    if verbose:
-        print(f"\n✗ BAŞARISIZ: {solution.get('message', 'Bilinmeyen hata')}")
-    comparison_df = None
+    weighted_sl_a = (day_data['calls_a'] * day_data['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
+    weighted_sl_b = (day_data['calls_b'] * day_data['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
+    
+    total_calls = total_calls_a + total_calls_b
+    daily_sl = ((total_calls_a * weighted_sl_a) + (total_calls_b * weighted_sl_b)) / total_calls if total_calls > 0 else 0
+    
+    daily_results.append({
+        'date': date,
+        'total_calls': int(total_calls),
+        'daily_sl_a': round(weighted_sl_a, 2),
+        'daily_sl_b': round(weighted_sl_b, 2),
+        'daily_sl_overall': round(daily_sl, 2)
+    })
 
-if verbose:
-    print("\n" + "=" * 80)
+return pd.DataFrame(daily_results)
+```
+
+def calculate_monthly_sl(interval_df):
+“”“Aylık Service Level”””
+total_calls_a = interval_df[‘calls_a’].sum()
+total_calls_b = interval_df[‘calls_b’].sum()
+
+```
+weighted_sl_a = (interval_df['calls_a'] * interval_df['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
+weighted_sl_b = (interval_df['calls_b'] * interval_df['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
+
+total_calls = total_calls_a + total_calls_b
+overall_sl = ((total_calls_a * weighted_sl_a) + (total_calls_b * weighted_sl_b)) / total_calls if total_calls > 0 else 0
 
 return {
-    'erlang_results': erlang_df,
-    'hourly_requirements': hourly_requirements,
-    'shift_solution': solution,
-    'comparison': comparison_df
+    'total_calls_a': int(total_calls_a),
+    'total_calls_b': int(total_calls_b),
+    'total_calls': int(total_calls),
+    'monthly_sl_a': round(weighted_sl_a, 2),
+    'monthly_sl_b': round(weighted_sl_b, 2),
+    'overall_sl': round(overall_sl, 2),
+    'target_met': overall_sl >= CONFIG['target_sl'] * 100
 }
 ```
 
-# ============================================================================
-
-# ÖRNEK KULLANIM
-
-# ============================================================================
-
-if **name** == “**main**”:
+def calculate_compliance_rate(daily_sl_df, min_sl=75, max_sl=85):
+“”“Günlerin kaçta kaçı hedef aralıkta?”””
+total_days = len(daily_sl_df)
 
 ```
-hourly_calls = [
-    100, 80, 60, 50, 60, 80,
-    150, 250, 400, 550,
-    650, 750, 800, 780,
-    700, 600, 500, 400,
-    300, 250, 200, 150,
-    120, 100
+if total_days == 0:
+    return None
+
+compliant_days = daily_sl_df[
+    (daily_sl_df['daily_sl_overall'] >= min_sl) & 
+    (daily_sl_df['daily_sl_overall'] <= max_sl)
 ]
 
-shifts_coverage = {
-    'Morning_06_14':   [0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0],
-    'Morning_07_15':   [0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
-    'Morning_08_16':   [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0],
-    'Afternoon_10_18': [0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0],
-    'Afternoon_12_20': [0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0],
-    'Afternoon_14_22': [0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0],
-    'Evening_16_00':   [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1],
-    'Evening_18_02':   [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1],
-    'Night_22_06':     [1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1],
-    'Night_00_08':     [1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-}
+compliant_count = len(compliant_days)
+compliance_rate = (compliant_count / total_days) * 100
 
-shift_costs = {
-    'Morning_06_14': 1.0,
-    'Morning_07_15': 1.0,
-    'Morning_08_16': 1.0,
-    'Afternoon_10_18': 1.0,
-    'Afternoon_12_20': 1.0,
-    'Afternoon_14_22': 1.0,
-    'Evening_16_00': 1.2,
-    'Evening_18_02': 1.2,
-    'Night_22_06': 1.5,
-    'Night_00_08': 1.5,
-}
+below = daily_sl_df[daily_sl_df['daily_sl_overall'] < min_sl]
+above = daily_sl_df[daily_sl_df['daily_sl_overall'] > max_sl]
 
-results = calculate_workforce_requirements(
-    hourly_calls=hourly_calls,
-    aht_minutes=5.0,
-    shifts_coverage=shifts_coverage,
-    target_asa_seconds=30,
-    shrinkage=0.30,
-    shift_costs=shift_costs
+return {
+    'total_days': total_days,
+    'compliant_days': compliant_count,
+    'compliance_rate': round(compliance_rate, 1),
+    'days_below': len(below),
+    'days_above': len(above),
+    'below_list': below[['date', 'daily_sl_overall']].to_dict('records'),
+    'above_list': above[['date', 'daily_sl_overall']].to_dict('records'),
+    'target_range': f'%{min_sl}-%{max_sl}'
+}
+```
+
+# ============================================================================
+
+# BÖLÜM 5: VARDİYA BİRLEŞTİRME VE PYWORKFORCE ENTEGRASYONU
+
+# ============================================================================
+
+def load_and_merge_shifts(excel_path):
+“””
+Vardiya Excel’ini oku ve şirketleri birleştir
+Kesişen vardiyalarda 1.company, tek şirkette o şirketin saatini al
+“””
+df = pd.read_excel(excel_path)
+
+```
+# Kolon isimlerini temizle
+df.columns = df.columns.str.strip().str.lower()
+
+merged = {}
+
+for shift_name in df['shift'].unique():
+    shift_data = df[df['shift'] == shift_name]
+    
+    # Start/end değerlerini string'e çevir
+    def time_to_str(val):
+        if hasattr(val, 'strftime'):
+            return val.strftime('%H:%M')
+        return str(val).strip()
+    
+    if len(shift_data) >= 2:
+        # İki şirket de var → 1.company saatlerini al
+        company1 = shift_data[shift_data['company'].str.contains('1', na=False)]
+        if len(company1) > 0:
+            merged[shift_name] = {
+                'start': time_to_str(company1['start'].values[0]),
+                'end': time_to_str(company1['end'].values[0])
+            }
+        else:
+            # 1.company yoksa ilk satırı al
+            merged[shift_name] = {
+                'start': time_to_str(shift_data['start'].values[0]),
+                'end': time_to_str(shift_data['end'].values[0])
+            }
+    else:
+        # Tek şirket → o şirketin saatini al
+        merged[shift_name] = {
+            'start': time_to_str(shift_data['start'].values[0]),
+            'end': time_to_str(shift_data['end'].values[0])
+        }
+
+return merged
+```
+
+def create_shifts_coverage(merged_shifts):
+“””
+Birleştirilmiş vardiyaları pyworkforce formatına çevir
+Her vardiya için 24 saatlik 0/1 dizisi
+“””
+coverage = {}
+
+```
+for shift_name, times in merged_shifts.items():
+    start_str = times['start']
+    end_str = times['end']
+    
+    # Saat değerini çıkar (07:00 → 7, 07:30 → 7)
+    start_hour = int(start_str.split(':')[0])
+    end_hour = int(end_str.split(':')[0])
+    
+    # 30 dakika varsa bir sonraki saate yuvarla (bitiş için)
+    end_min = int(end_str.split(':')[1]) if ':' in end_str else 0
+    if end_min >= 30:
+        end_hour = (end_hour + 1) % 24
+    
+    # 24 saatlik dizi oluştur
+    hours = [0] * 24
+    
+    if end_hour > start_hour:
+        # Normal vardiya (örn: 07:00-16:00)
+        for h in range(start_hour, end_hour):
+            hours[h] = 1
+    elif end_hour < start_hour:
+        # Gece vardiyası (örn: 22:00-06:00)
+        for h in range(start_hour, 24):
+            hours[h] = 1
+        for h in range(0, end_hour):
+            hours[h] = 1
+    else:
+        # Aynı saat (24 saatlik vardiya veya hata)
+        hours[start_hour] = 1
+    
+    coverage[shift_name] = hours
+
+return coverage
+```
+
+def prepare_required_resources(interval_df):
+“””
+interval_df’i pyworkforce formatına çevir
+Her satır bir gün, her sütun bir saat (24 saat)
+“””
+required = []
+
+```
+for date in sorted(interval_df['date'].unique()):
+    day_data = interval_df[interval_df['date'] == date].copy()
+    
+    # Saat değerini çıkar
+    day_data['hour'] = day_data['time'].apply(lambda x: int(str(x).split(':')[0]))
+    day_data = day_data.sort_values('hour')
+    
+    # 24 saatlik dizi oluştur
+    hourly_agents = [0] * 24
+    for _, row in day_data.iterrows():
+        hour = row['hour']
+        hourly_agents[hour] = int(row['total_agents'])
+    
+    required.append(hourly_agents)
+
+return required
+```
+
+def optimize_shifts(interval_df, merged_shifts, config):
+“””
+pyworkforce ile vardiya optimizasyonu
+“””
+# Verileri hazırla
+required_resources = prepare_required_resources(interval_df)
+shifts_coverage = create_shifts_coverage(merged_shifts)
+
+```
+num_days = len(required_resources)
+
+print(f"\n📊 Optimizasyon Verileri:")
+print(f"   Gün sayısı: {num_days}")
+print(f"   Vardiya sayısı: {len(shifts_coverage)}")
+print(f"   Günlük max ihtiyaç: {max(max(day) for day in required_resources)}")
+
+# Optimizasyonu çalıştır
+try:
+    scheduler = MinRequiredResources(
+        num_days=num_days,
+        periods=24,
+        shifts_coverage=shifts_coverage,
+        required_resources=required_resources,
+        max_period_concurrency=config['optimization']['max_period_concurrency'],
+        max_shift_concurrency=config['optimization']['max_shift_concurrency'],
+        max_search_time=config['optimization']['max_search_time']
+    )
+    
+    solution = scheduler.solve()
+    
+    return solution
+    
+except Exception as e:
+    print(f"❌ Optimizasyon hatası: {e}")
+    return None
+```
+
+def solution_to_dataframe(solution, interval_df):
+“””
+Optimizasyon sonucunu DataFrame’e çevir
+“””
+if solution is None or solution[‘status’] != ‘OPTIMAL’:
+return None
+
+```
+dates = sorted(interval_df['date'].unique())
+
+results = []
+for item in solution['resources_shifts']:
+    day_idx = item['day']
+    shift = item['shift']
+    resources = item['resources']
+    
+    if resources > 0:
+        results.append({
+            'date': dates[day_idx] if day_idx < len(dates) else f'Day {day_idx}',
+            'shift': shift,
+            'agents': resources
+        })
+
+return pd.DataFrame(results)
+```
+
+# ============================================================================
+
+# ANA FONKSİYON
+
+# ============================================================================
+
+def calculate_complete_planning(df, shift_excel):
+“””
+Komple kapasite planlaması
+ASA bazlı hesaplama + pyworkforce optimizasyonu
+“””
+
+```
+print("=" * 80)
+print("KAPASİTE PLANLAMA SİSTEMİ - V3 (PYWORKFORCE)")
+print("=" * 80)
+
+print(f"\n⚙️ Konfigürasyon:")
+print(f"   AHT: {CONFIG['aht']} saniye")
+print(f"   Hedef ASA: ≤ {CONFIG['target_asa']} saniye")
+print(f"   Hedef Aylık SL: ≥ %{CONFIG['target_sl']*100}")
+print(f"   Shrinkage: %{CONFIG['shrinkage']*100}")
+
+# BÖLÜM 1: Vardiyaları yükle ve birleştir
+print(f"\n📂 BÖLÜM 1: Vardiyalar yükleniyor...")
+merged_shifts = load_and_merge_shifts(shift_excel)
+print(f"   ✅ {len(merged_shifts)} vardiya birleştirildi")
+
+for name, times in list(merged_shifts.items())[:5]:
+    print(f"      {name}: {times['start']} - {times['end']}")
+if len(merged_shifts) > 5:
+    print(f"      ... ve {len(merged_shifts) - 5} vardiya daha")
+
+# BÖLÜM 2: Interval bazlı hesaplama
+print(f"\n⚙️ BÖLÜM 2: Agent ihtiyacı hesaplanıyor...")
+interval_df = calculate_interval_requirements(df, CONFIG)
+print(f"   ✅ {len(interval_df)} interval hesaplandı")
+print(f"   Peak agent: {interval_df['total_agents'].max()}")
+print(f"   Ortalama agent: {interval_df['total_agents'].mean():.0f}")
+
+# BÖLÜM 3: Günlük ve Aylık SL
+print(f"\n📊 BÖLÜM 3: SL metrikleri hesaplanıyor...")
+daily_sl_df = calculate_daily_sl(interval_df)
+monthly_sl = calculate_monthly_sl(interval_df)
+compliance = calculate_compliance_rate(
+    daily_sl_df, 
+    CONFIG['compliance']['min_sl'], 
+    CONFIG['compliance']['max_sl']
 )
 
-# Excel export
-results['erlang_results'].to_excel('/mnt/user-data/outputs/erlang_results.xlsx', index=False)
-results['comparison'].to_excel('/mnt/user-data/outputs/shift_comparison.xlsx', index=False)
-print("\n✓ Excel dosyaları kaydedildi!")
+print(f"   ✅ Aylık SL: %{monthly_sl['overall_sl']}")
+print(f"   {'✅ KARŞILANDI' if monthly_sl['target_met'] else '❌ KARŞILANMADI'}")
+print(f"   ✅ Compliance Rate: %{compliance['compliance_rate']} ({compliance['compliant_days']}/{compliance['total_days']} gün)")
+
+# BÖLÜM 4: Vardiya optimizasyonu
+print(f"\n🔧 BÖLÜM 4: Vardiya optimizasyonu çalışıyor...")
+solution = optimize_shifts(interval_df, merged_shifts, CONFIG)
+
+if solution and solution['status'] == 'OPTIMAL':
+    print(f"   ✅ Optimizasyon başarılı!")
+    print(f"   Toplam maliyet (agent-gün): {solution['cost']}")
+    
+    vardiya_df = solution_to_dataframe(solution, interval_df)
+    
+    # Özet istatistikler
+    if vardiya_df is not None and len(vardiya_df) > 0:
+        daily_total = vardiya_df.groupby('date')['agents'].sum()
+        print(f"   Günlük ortalama agent: {daily_total.mean():.0f}")
+        print(f"   Günlük max agent: {daily_total.max()}")
+else:
+    print(f"   ❌ Optimizasyon başarısız: {solution['status'] if solution else 'Hata'}")
+    vardiya_df = None
+
+print("\n" + "=" * 80)
+print("✅ TAMAMLANDI!")
+print("=" * 80)
+
+return interval_df, vardiya_df, daily_sl_df, monthly_sl, compliance, solution
 ```
+
+# ============================================================================
+
+# YARDIMCI FONKSİYONLAR
+
+# ============================================================================
+
+def print_shift_summary(vardiya_df):
+“”“Vardiya bazlı özet rapor”””
+if vardiya_df is None or len(vardiya_df) == 0:
+print(“Vardiya verisi yok!”)
+return
+
+```
+print("\n📋 VARDİYA BAZLI ÖZET:")
+print("-" * 50)
+
+summary = vardiya_df.groupby('shift')['agents'].agg(['mean', 'min', 'max', 'sum'])
+summary.columns = ['Ortalama', 'Min', 'Max', 'Toplam']
+summary = summary.round(0).astype(int)
+
+print(summary.to_string())
+
+print(f"\n📊 GÜNLÜK ÖZET:")
+print("-" * 50)
+daily = vardiya_df.groupby('date')['agents'].sum()
+print(f"   Ortalama: {daily.mean():.0f} agent/gün")
+print(f"   Min: {daily.min()} agent/gün")
+print(f"   Max: {daily.max()} agent/gün")
+```
+
+def export_results(interval_df, vardiya_df, daily_sl_df, prefix=‘sonuc’):
+“”“Sonuçları Excel’e kaydet”””
+interval_df.to_excel(f’{prefix}_interval.xlsx’, index=False)
+daily_sl_df.to_excel(f’{prefix}_gunluk_sl.xlsx’, index=False)
+
+```
+if vardiya_df is not None:
+    vardiya_df.to_excel(f'{prefix}_vardiya.xlsx', index=False)
+
+print(f"✅ Dosyalar kaydedildi: {prefix}_*.xlsx")
+```
+
+# ============================================================================
+
+# KULLANIM
+
+# ============================================================================
+
+if **name** == ‘**main**’:
+print(”””
+╔════════════════════════════════════════════════════════════════╗
+║  KAPASİTE PLANLAMA SİSTEMİ - V3                               ║
+║  ASA Bazlı + pyworkforce Optimizasyonu                        ║
+╚════════════════════════════════════════════════════════════════╝
+
+KURULUM:
+pip install pyworkforce pandas openpyxl
+
+KULLANIM:
+
+# Veriyi oku
+
+df = pd.read_excel(‘cagri_tahminleri.xlsx’)
+
+# 15dk’yı saate topla (eğer gerekliyse)
+
+df[‘hour’] = pd.to_datetime(df[‘time’], format=’%H:%M’).dt.hour
+df_hourly = df.groupby([‘date’, ‘hour’]).agg({
+‘queue_a’: ‘sum’,
+‘queue_b’: ‘sum’
+}).reset_index()
+df_hourly[‘time’] = df_hourly[‘hour’].apply(lambda x: f’{x:02d}:00’)
+
+# Hesapla
+
+interval_df, vardiya_df, daily_sl_df, monthly_sl, compliance, solution = calculate_complete_planning(
+df_hourly,
+shift_excel=‘vardiyalar.xlsx’
+)
+
+# Özet rapor
+
+print_shift_summary(vardiya_df)
+
+# Kaydet
+
+export_results(interval_df, vardiya_df, daily_sl_df, prefix=‘sonuc’)
+
+print(f”Aylık SL: %{monthly_sl[‘overall_sl’]}”)
+print(f”Compliance Rate: %{compliance[‘compliance_rate’]}”)
+“””)
