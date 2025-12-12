@@ -1,672 +1,360 @@
-"""
-KOMPLE KAPASİTE PLANLAMA SİSTEMİ - V2
-ASA + Service Level (Saatlik ASA + Günlük Takip + Aylık Hedef)
-Peak Öncelikli Vardiya Dağıtımı
-Compliance Rate Takibi
+# “””
+CALL CENTER WORKFORCE MANAGEMENT - UPDATED VERSION
 
 Güncellemeler:
-- min_sl floor eklendi (%75 altına düşmez)
-- Compliance rate fonksiyonu eklendi (%75-85 aralık takibi)
-"""
+
+1. ErlangC hesaplamaları aynı kaldı
+1. Eski peak-based vardiya hesaplaması KALDIRILDI
+1. MinRequiredResources (Linear Programming) EKLENDİ
+   “””
+
+import numpy as np
 import pandas as pd
+from scipy.optimize import linprog
+from scipy.special import factorial
 import math
 
 # ============================================================================
-# KONFIGURASYON
+
+# ERLANG C FUNCTIONS (Aynı)
+
 # ============================================================================
 
-CONFIG = {
-    'aht': 188,              # Average Handle Time - saniye (gerçek değer)
-    'target_asa': 30,        # Hedef ASA - saniye
-    'target_sl': 0.80,       # Hedef Service Level - %80 (aylık kontrol)
-    'target_seconds': 30,    # SL için hedef süre - saniye
-    'shrinkage': 0.10,       # Mola/izin payı - %10
-    'interval_minutes': 60,  # İnterval - dakika
-    'peak_hours': {
-        'start': 9,          # Peak başlangıç
-        'end': 18            # Peak bitiş
-    },
-    'compliance': {
-        'min_sl': 75,        # Compliance alt sınır %
-        'max_sl': 85         # Compliance üst sınır %
-    }
+def erlang_c(agents, traffic_intensity):
+“”“Erlang C formülü”””
+if agents <= traffic_intensity:
+return 1.0
+
+```
+numerator = (traffic_intensity ** agents / factorial(agents)) * \
+            (agents / (agents - traffic_intensity))
+
+denominator = sum([traffic_intensity ** k / factorial(k) for k in range(agents)])
+denominator += numerator
+
+return numerator / denominator
+```
+
+def calculate_asa(agents, traffic_intensity, aht_minutes):
+“”“Average Speed of Answer”””
+if agents <= traffic_intensity:
+return float(‘inf’)
+
+```
+pw = erlang_c(agents, traffic_intensity)
+return (pw * aht_minutes) / (agents - traffic_intensity)
+```
+
+def calculate_service_level(agents, traffic_intensity, aht_minutes, target_answer_time_seconds):
+“”“Service Level”””
+if agents <= traffic_intensity:
+return 0.0
+
+```
+pw = erlang_c(agents, traffic_intensity)
+target_minutes = target_answer_time_seconds / 60
+exponent = -(agents - traffic_intensity) * target_minutes / aht_minutes
+
+return max(0.0, min(1.0, 1 - (pw * math.exp(exponent))))
+```
+
+def find_required_agents_for_asa(
+hourly_calls,
+aht_minutes,
+target_asa_seconds=30,
+shrinkage=0.30,
+max_iterations=200
+):
+“”“ASA hedefine göre gerekli ajan sayısını bul”””
+if hourly_calls == 0:
+return {
+‘raw_agents’: 0,
+‘adjusted_agents’: 0,
+‘asa_seconds’: 0,
+‘service_level_80_20’: 1.0,
+‘occupancy’: 0,
+‘traffic_intensity’: 0
 }
 
+```
+traffic_intensity = (hourly_calls * aht_minutes) / 60
+min_agents = max(1, int(np.ceil(traffic_intensity)) + 1)
+target_asa_minutes = target_asa_seconds / 60
+
+best_agents = min_agents
+for agents in range(min_agents, min_agents + max_iterations):
+    asa = calculate_asa(agents, traffic_intensity, aht_minutes)
+    if asa <= target_asa_minutes:
+        best_agents = agents
+        break
+
+final_asa = calculate_asa(best_agents, traffic_intensity, aht_minutes)
+final_sl = calculate_service_level(best_agents, traffic_intensity, aht_minutes, 20)
+occupancy = traffic_intensity / best_agents if best_agents > 0 else 0
+adjusted_agents = int(np.ceil(best_agents / (1 - shrinkage)))
+
+return {
+    'raw_agents': best_agents,
+    'adjusted_agents': adjusted_agents,
+    'asa_seconds': final_asa * 60,
+    'service_level_80_20': final_sl,
+    'occupancy': occupancy,
+    'traffic_intensity': traffic_intensity
+}
+```
 
 # ============================================================================
-# BÖLÜM 1: ERLANG C TEMELLERİ
-# ============================================================================
 
-def erlang_c(agents, traffic):
-    """
-    Erlang C: Kuyrukta bekleme olasılığı
-    
-    Parametreler:
-        agents: Agent sayısı
-        traffic: Erlang cinsinden trafik yoğunluğu
-    
-    Döndürür:
-        0-1 arası olasılık değeri
-    """
-    if agents <= traffic or agents == 0:
-        return 1.0
-    
-    # Erlang B hesapla (meşgul olasılığı)
-    erlang_b = traffic / agents
-    for i in range(2, int(agents) + 1):
-        erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
-    
-    # Erlang C = Erlang B'den türetilir
-    erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
-    return min(erlang_c_val, 1.0)
-
-
-def calculate_asa(agents, traffic, aht):
-    """
-    ASA (Average Speed to Answer) hesapla
-    
-    Parametreler:
-        agents: Agent sayısı
-        traffic: Erlang cinsinden trafik
-        aht: Average Handle Time (saniye)
-    
-    Döndürür:
-        ASA değeri (saniye)
-    """
-    if agents <= traffic or agents == 0:
-        return 999
-    
-    ec = erlang_c(agents, traffic)
-    asa = (ec * (aht / 60)) / (agents - traffic) * 60
-    return asa
-
-
-def calculate_service_level(agents, traffic, aht, target_seconds):
-    """
-    Service Level hesapla
-    
-    Parametreler:
-        agents: Agent sayısı
-        traffic: Erlang cinsinden trafik
-        aht: Average Handle Time (saniye)
-        target_seconds: Hedef cevaplama süresi (saniye)
-    
-    Döndürür:
-        0-1 arası SL değeri (örn: 0.80 = %80)
-    """
-    if agents <= traffic or agents == 0:
-        return 0.0
-    
-    ec = erlang_c(agents, traffic)
-    exp_term = math.exp(-(agents - traffic) * (target_seconds / aht))
-    sl = 1 - (ec * exp_term)
-    
-    return max(0, min(1, sl))
-
-
-def calculate_traffic(calls, interval_min, aht):
-    """
-    Traffic (Erlang) hesapla
-    
-    Parametreler:
-        calls: Çağrı sayısı
-        interval_min: İnterval süresi (dakika)
-        aht: Average Handle Time (saniye)
-    
-    Döndürür:
-        Erlang cinsinden trafik değeri
-    """
-    if calls == 0:
-        return 0
-    return (calls * (aht / 60)) / interval_min
-
+# YENİ: MIN REQUIRED RESOURCES (Linear Programming)
 
 # ============================================================================
-# BÖLÜM 2: AGENT SAYISI BULMA (ASA + SL)
-# ============================================================================
 
-def find_agents_for_asa(calls, interval_min, aht, target_asa):
-    """
-    ASA hedefi için gereken agent sayısı
-    
-    ADIM ADIM:
-    1. Çağrı yoksa → 0 agent döndür
-    2. Traffic hesapla (Erlang)
-    3. Minimum agent = ceil(traffic) → en az bu kadar lazım
-    4. Yukarı doğru tara, ASA ≤ hedef olan ilk değeri bul
-    
-    Parametreler:
-        calls: Çağrı sayısı
-        interval_min: İnterval süresi (dakika)
-        aht: Average Handle Time (saniye)
-        target_asa: Hedef ASA (saniye)
-    
-    Döndürür:
-        Gereken agent sayısı
-    """
-    # ADIM 1: Çağrı kontrolü
-    if calls == 0:
-        return 0
-    
-    # ADIM 2: Traffic hesapla
-    traffic = calculate_traffic(calls, interval_min, aht)
-    if traffic == 0:
-        return 0
-    
-    # ADIM 3: Arama aralığını belirle
-    min_agents = math.ceil(traffic)      # En az traffic kadar agent lazım
-    max_agents = math.ceil(traffic * 2) + 5  # Üst sınır (güvenlik payı)
-    
-    # ADIM 4: Linear search - ASA hedefini karşılayan ilk agent sayısı
-    for agents in range(min_agents, max_agents + 1):
-        asa = calculate_asa(agents, traffic, aht)
-        if asa <= target_asa:
-            return agents
-    
-    return max_agents
+class MinRequiredResources:
+“””
+Linear Programming ile vardiya optimizasyonu
+“””
 
-
-def find_agents_for_sl(calls, interval_min, aht, target_sl, target_seconds, tolerance, min_sl):
-    """
-    SL hedefi için gereken agent sayısı
+```
+def __init__(self, shifts_coverage, required_resources, shift_costs=None, max_shift_capacity=None):
+    self.shifts_coverage = shifts_coverage
+    self.required_resources = required_resources
+    self.shift_names = list(shifts_coverage.keys())
+    self.num_shifts = len(self.shift_names)
+    self.num_hours = len(required_resources)
     
-    ADIM ADIM:
-    1. Çağrı yoksa → 0 agent döndür
-    2. Traffic hesapla
-    3. Arama aralığını belirle
-    4. HARD FLOOR: Önce min_sl (%75) sağlayan minimum agent bul
-    5. Floor'dan başlayarak target_sl'ye (%80) en yakın olanı seç
-    
-    Parametreler:
-        calls: Çağrı sayısı
-        interval_min: İnterval süresi (dakika)
-        aht: Average Handle Time (saniye)
-        target_sl: Hedef SL (örn: 0.80)
-        target_seconds: Hedef cevaplama süresi (saniye)
-        tolerance: Tolerans (örn: 0.02 = ±%2)
-        min_sl: Minimum SL floor (örn: 0.75 - asla altına düşmez)
-    
-    Döndürür:
-        Gereken agent sayısı
-    """
-    # ADIM 1: Çağrı kontrolü
-    if calls == 0:
-        return 0
-    
-    # ADIM 2: Traffic hesapla
-    traffic = calculate_traffic(calls, interval_min, aht)
-    if traffic == 0:
-        return 0
-    
-    # ADIM 3: Arama aralığını belirle
-    min_agents = math.ceil(traffic)
-    max_agents = math.ceil(traffic * 2) + 10
-    
-    # ADIM 4: HARD FLOOR - min_sl (%75) sağlayan minimum agent bul
-    floor_agents = max_agents  # Başlangıç değeri
-    for agents in range(min_agents, max_agents + 1):
-        sl = calculate_service_level(agents, traffic, aht, target_seconds)
-        if sl >= min_sl:  # %75'i geçen ilk değer
-            floor_agents = agents
-            break
-    
-    # ADIM 5: Floor'dan başlayarak target'a (%80) en yakın olanı bul
-    best_agent = floor_agents
-    best_diff = 1.0
-    
-    for agents in range(floor_agents, max_agents + 1):
-        sl = calculate_service_level(agents, traffic, aht, target_seconds)
-        diff = abs(sl - target_sl)
-        
-        # Tolerans içinde ve şimdiye kadarki en iyi
-        if diff <= tolerance and diff < best_diff:
-            best_agent = agents
-            best_diff = diff
-            
-            # Tam hedefte, daha aramaya gerek yok
-            if diff < 0.001:
-                break
-    
-    return best_agent
-
-
-def find_optimal_agents(calls, config):
-    """
-    Sadece ASA bazlı agent hesabı
-    SL interval bazında hedef değil, aylık kontrol için hesaplanıyor
-    
-    ADIM ADIM:
-    1. Çağrı yoksa → (0,0,0) döndür
-    2. ASA için gereken agent sayısını bul
-    3. Shrinkage ekle (mola/izin payı)
-    4. SL'yi bilgi amaçlı hesapla (karar verici değil)
-    
-    Parametreler:
-        calls: Çağrı sayısı
-        config: Konfigürasyon dictionary
-    
-    Döndürür:
-        (agents_final, final_asa, final_sl)
-    """
-    # ADIM 1: Çağrı kontrolü
-    if calls == 0:
-        return 0, 0, 0
-    
-    # ADIM 2: Sadece ASA için agent sayısı
-    agents_raw = find_agents_for_asa(
-        calls, 
-        config['interval_minutes'],
-        config['aht'],
-        config['target_asa']
-    )
-    
-    # ADIM 3: Shrinkage ekle
-    agents_final = math.ceil(agents_raw / (1 - config['shrinkage']))
-    
-    # ADIM 4: SL'yi bilgi amaçlı hesapla (aylık kontrolde kullanılacak)
-    traffic = calculate_traffic(calls, config['interval_minutes'], config['aht'])
-    final_asa = calculate_asa(agents_raw, traffic, config['aht'])
-    final_sl = calculate_service_level(agents_raw, traffic, config['aht'], config['target_seconds'])
-    
-    return agents_final, final_asa, final_sl
-
-
-# ============================================================================
-# BÖLÜM 3: INTERVAL BAZLI İHTİYAÇ
-# ============================================================================
-
-def calculate_interval_requirements(df, config):
-    """Her interval için agent ihtiyacını hesapla (Sadece ASA bazlı)"""
-    results = []
-    
-    for idx, row in df.iterrows():
-        date = row['date']
-        time = row['time']
-        
-        # Time formatını düzelt
-        if hasattr(time, 'strftime'):
-            time = time.strftime('%H:%M')
-        elif not isinstance(time, str):
-            time = str(time)
-        
-        calls_a = row['queue_a']
-        calls_b = row['queue_b']
-        
-        # Her queue için optimal agent bul (sadece ASA bazlı)
-        agents_a, final_asa_a, final_sl_a = find_optimal_agents(calls_a, config)
-        agents_b, final_asa_b, final_sl_b = find_optimal_agents(calls_b, config)
-        
-        results.append({
-            'date': date,
-            'time': time,
-            'calls_a': calls_a,
-            'calls_b': calls_b,
-            'agents_a': agents_a,
-            'agents_b': agents_b,
-            'total_agents': agents_a + agents_b,
-            'asa_a': round(final_asa_a, 1),
-            'sl_a': round(final_sl_a * 100, 1),
-            'asa_b': round(final_asa_b, 1),
-            'sl_b': round(final_sl_b * 100, 1)
-        })
-    
-    return pd.DataFrame(results)
-
-
-# ============================================================================
-# BÖLÜM 4: GÜNLÜK ve AYLIK SERVICE LEVEL + COMPLIANCE
-# ============================================================================
-
-def calculate_daily_sl(interval_df):
-    """Günlük Service Level (bilgi amaçlı)"""
-    daily_results = []
-    
-    for date in sorted(interval_df['date'].unique()):
-        day_data = interval_df[interval_df['date'] == date]
-        
-        total_calls_a = day_data['calls_a'].sum()
-        total_calls_b = day_data['calls_b'].sum()
-        
-        # Ağırlıklı ortalama SL
-        weighted_sl_a = (day_data['calls_a'] * day_data['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
-        weighted_sl_b = (day_data['calls_b'] * day_data['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
-        
-        total_calls = total_calls_a + total_calls_b
-        daily_sl = ((total_calls_a * weighted_sl_a) + (total_calls_b * weighted_sl_b)) / total_calls if total_calls > 0 else 0
-        
-        daily_results.append({
-            'date': date,
-            'total_calls': int(total_calls),
-            'daily_sl_a': round(weighted_sl_a, 2),
-            'daily_sl_b': round(weighted_sl_b, 2),
-            'daily_sl_overall': round(daily_sl, 2)
-        })
-    
-    return pd.DataFrame(daily_results)
-
-
-def calculate_monthly_sl(interval_df):
-    """Aylık Service Level (ZORUNLU HEDEF)"""
-    total_calls_a = interval_df['calls_a'].sum()
-    total_calls_b = interval_df['calls_b'].sum()
-    
-    weighted_sl_a = (interval_df['calls_a'] * interval_df['sl_a']).sum() / total_calls_a if total_calls_a > 0 else 0
-    weighted_sl_b = (interval_df['calls_b'] * interval_df['sl_b']).sum() / total_calls_b if total_calls_b > 0 else 0
-    
-    total_calls = total_calls_a + total_calls_b
-    overall_sl = ((total_calls_a * weighted_sl_a) + (total_calls_b * weighted_sl_b)) / total_calls if total_calls > 0 else 0
-    
-    return {
-        'total_calls_a': int(total_calls_a),
-        'total_calls_b': int(total_calls_b),
-        'total_calls': int(total_calls),
-        'monthly_sl_a': round(weighted_sl_a, 2),
-        'monthly_sl_b': round(weighted_sl_b, 2),
-        'overall_sl': round(overall_sl, 2),
-        'target_met': overall_sl >= CONFIG['target_sl'] * 100
-    }
-
-
-def calculate_compliance_rate(daily_sl_df, min_sl=75, max_sl=85):
-    """
-    Günlerin kaçta kaçı hedef aralıkta?
-    Tutarlılık ölçümü - hem understaffing hem overstaffing'i yakalar
-    
-    ADIM ADIM:
-    1. Toplam gün sayısını al
-    2. %75-85 aralığındaki günleri filtrele
-    3. Compliance rate hesapla
-    4. Aralık dışı günleri listele
-    
-    Parametreler:
-        daily_sl_df: Günlük SL dataframe'i
-        min_sl: Alt sınır (default: 75)
-        max_sl: Üst sınır (default: 85)
-    
-    Döndürür:
-        Compliance istatistikleri dictionary
-    """
-    # ADIM 1: Toplam gün
-    total_days = len(daily_sl_df)
-    
-    if total_days == 0:
-        return None
-    
-    # ADIM 2: Aralıktaki günleri filtrele
-    compliant_days = daily_sl_df[
-        (daily_sl_df['daily_sl_overall'] >= min_sl) & 
-        (daily_sl_df['daily_sl_overall'] <= max_sl)
-    ]
-    
-    compliant_count = len(compliant_days)
-    
-    # ADIM 3: Compliance rate
-    compliance_rate = (compliant_count / total_days) * 100
-    
-    # ADIM 4: Aralık dışı günler
-    below = daily_sl_df[daily_sl_df['daily_sl_overall'] < min_sl]
-    above = daily_sl_df[daily_sl_df['daily_sl_overall'] > max_sl]
-    
-    return {
-        'total_days': total_days,
-        'compliant_days': compliant_count,
-        'compliance_rate': round(compliance_rate, 1),
-        'days_below': len(below),
-        'days_above': len(above),
-        'below_list': below[['date', 'daily_sl_overall']].to_dict('records'),
-        'above_list': above[['date', 'daily_sl_overall']].to_dict('records'),
-        'target_range': f'%{min_sl}-%{max_sl}'
-    }
-
-
-# ============================================================================
-# BÖLÜM 5: VARDİYA YÖNETİMİ
-# ============================================================================
-
-def load_shifts_from_excel(excel_path):
-    """Vardiya Excel'den oku"""
-    df = pd.read_excel(excel_path)
-    
-    required = ['shift', 'start', 'end']
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise ValueError(f"❌ Eksik kolonlar: {missing}")
-    
-    shifts = []
-    for _, row in df.iterrows():
-        shifts.append({
-            'name': str(row['shift']),
-            'start': str(row['start']) if not hasattr(row['start'], 'strftime') else row['start'].strftime('%H:%M'),
-            'end': str(row['end']) if not hasattr(row['end'], 'strftime') else row['end'].strftime('%H:%M'),
-            'company': str(row.get('company', ''))
-        })
-    
-    return shifts
-
-
-def time_to_minutes(time_str):
-    """'07:30' → 450 dakika"""
-    if hasattr(time_str, 'strftime'):
-        time_str = time_str.strftime('%H:%M')
-    h, m = map(int, str(time_str).split(':'))
-    return h * 60 + m
-
-
-def is_time_in_shift(time_str, shift_start, shift_end):
-    """Bir zaman vardiya içinde mi?"""
-    time_min = time_to_minutes(time_str)
-    start_min = time_to_minutes(shift_start)
-    end_min = time_to_minutes(shift_end)
-    
-    # Gece vardiyası kontrolü (örn: 22:00 - 06:00)
-    if end_min <= start_min:
-        return time_min >= start_min or time_min < end_min
+    if shift_costs is None:
+        self.shift_costs = {shift: 1.0 for shift in self.shift_names}
     else:
-        return start_min <= time_min < end_min
+        self.shift_costs = shift_costs
+        
+    self.max_shift_capacity = max_shift_capacity
 
-
-def is_peak_hour(time_str):
-    """Peak saat mi?"""
-    hour = int(time_str.split(':')[0])
-    return CONFIG['peak_hours']['start'] <= hour < CONFIG['peak_hours']['end']
-
-
-def is_peak_shift(shift):
-    """Peak vardiya mı?"""
-    shift_start_hour = int(shift['start'].split(':')[0])
-    return CONFIG['peak_hours']['start'] <= shift_start_hour < CONFIG['peak_hours']['end']
-
-
-def distribute_to_shifts(interval_df, shifts):
-    """Vardiyalara peak öncelikli dağıt"""
-    results = []
+def solve(self):
+    """Linear Programming ile çöz"""
     
-    for idx, row in interval_df.iterrows():
-        date = row['date']
-        time = row['time']
-        total_needed = row['total_agents']
-        
-        if total_needed == 0:
-            continue
-        
-        is_peak = is_peak_hour(time)
-        
-        # Bu saatte çalışan vardiyaları bul
-        working_shifts = []
-        for shift in shifts:
-            if is_time_in_shift(time, shift['start'], shift['end']):
-                is_peak_shift_flag = is_peak_shift(shift)
-                weight = 1.5 if (is_peak and is_peak_shift_flag) else 1.0
-                
-                working_shifts.append({
-                    'name': shift['name'],
-                    'weight': weight
-                })
-        
-        if len(working_shifts) == 0:
-            continue
-        
-        # Ağırlıklı dağıtım
-        total_weight = sum(ws['weight'] for ws in working_shifts)
-        
-        distribution = {}
-        for ws in working_shifts:
-            ratio = ws['weight'] / total_weight
-            distribution[ws['name']] = total_needed * ratio
-        
-        # Yuvarlama düzeltmesi
-        current_total = sum(math.floor(v) for v in distribution.values())
-        needed_diff = total_needed - current_total
-        
-        if needed_diff > 0:
-            decimals = {k: v - math.floor(v) for k, v in distribution.items()}
-            sorted_shifts = sorted(decimals.items(), key=lambda x: x[1], reverse=True)
-            
-            for i in range(needed_diff):
-                shift_name = sorted_shifts[i % len(sorted_shifts)][0]
-                distribution[shift_name] += 1
-        
-        for shift_name, agents in distribution.items():
-            final_agents = math.floor(agents)
-            if final_agents > 0:
-                results.append({
-                    'date': date,
-                    'time': time,
-                    'shift': shift_name,
-                    'agents_needed': final_agents
-                })
+    # Objective: minimize toplam ajan (maliyet ağırlıklı)
+    c = [self.shift_costs[shift] for shift in self.shift_names]
     
-    return pd.DataFrame(results)
-
-
-def aggregate_shifts(distribution_df, shifts):
-    """Vardiya bazlı MAX agent"""
-    shift_results = []
+    # Constraints: Her saat için >= kısıtı
+    A_ub = []
+    b_ub = []
     
-    for date in sorted(distribution_df['date'].unique()):
-        date_data = distribution_df[distribution_df['date'] == date]
+    for hour in range(self.num_hours):
+        constraint_row = []
+        for shift in self.shift_names:
+            constraint_row.append(-self.shifts_coverage[shift][hour])
+        A_ub.append(constraint_row)
+        b_ub.append(-self.required_resources[hour])
+    
+    # Bounds
+    bounds = []
+    for shift in self.shift_names:
+        if self.max_shift_capacity and shift in self.max_shift_capacity:
+            bounds.append((0, self.max_shift_capacity[shift]))
+        else:
+            bounds.append((0, None))
+    
+    # Solve
+    result = linprog(c=c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs', options={'disp': False})
+    
+    if result.success:
+        shift_assignments = {}
+        for i, shift in enumerate(self.shift_names):
+            shift_assignments[shift] = np.ceil(result.x[i])
         
-        for shift in shifts:
-            shift_data = date_data[date_data['shift'] == shift['name']]
-            
-            if len(shift_data) > 0:
-                max_agents = math.ceil(shift_data['agents_needed'].max())
-                
-                shift_results.append({
-                    'date': date,
-                    'shift': shift['name'],
-                    'start': shift['start'],
-                    'end': shift['end'],
-                    'company': shift.get('company', ''),
-                    'agents': max_agents
-                })
-    
-    return pd.DataFrame(shift_results)
+        hourly_coverage = self._calculate_hourly_coverage(shift_assignments)
+        hourly_difference = [hourly_coverage[h] - self.required_resources[h] for h in range(self.num_hours)]
+        
+        return {
+            'status': 'optimal',
+            'total_agents': sum(shift_assignments.values()),
+            'shift_assignments': shift_assignments,
+            'hourly_coverage': hourly_coverage,
+            'hourly_difference': hourly_difference,
+            'all_constraints_met': all(d >= 0 for d in hourly_difference)
+        }
+    else:
+        return {'status': 'infeasible', 'message': result.message}
 
+def _calculate_hourly_coverage(self, shift_assignments):
+    hourly_coverage = [0.0] * self.num_hours
+    for shift, agents in shift_assignments.items():
+        for hour in range(self.num_hours):
+            if self.shifts_coverage[shift][hour] == 1:
+                hourly_coverage[hour] += agents
+    return hourly_coverage
+```
 
 # ============================================================================
-# ANA FONKSİYON
+
+# ANA WORKFLOW
+
 # ============================================================================
 
-def calculate_complete_planning(df, shift_excel):
-    """
-    Komple kapasite planlaması
-    ASA + SL (Saatlik ASA + Günlük Takip + Aylık Hedef)
-    Compliance Rate Takibi
-    """
-    
+def calculate_workforce_requirements(
+hourly_calls,
+aht_minutes,
+shifts_coverage,
+target_asa_seconds=30,
+shrinkage=0.30,
+shift_costs=None,
+max_shift_capacity=None,
+verbose=True
+):
+“””
+Ana workflow: ErlangC + Linear Programming
+“””
+
+```
+if verbose:
     print("=" * 80)
-    print("KAPASİTE PLANLAMA SİSTEMİ - V2 (ASA BAZLI)")
+    print("CALL CENTER WORKFORCE MANAGEMENT")
     print("=" * 80)
-    print(f"\n⚙️ Hedefler:")
-    print(f"   Saatlik: ASA ≤ {CONFIG['target_asa']} saniye")
-    print(f"   Aylık SL: ≥ %{CONFIG['target_sl']*100} (kontrol)")
-    print(f"   AHT: {CONFIG['aht']} saniye")
-    print(f"   Shrinkage: %{CONFIG['shrinkage']*100}")
-    print(f"   Compliance: %{CONFIG['compliance']['min_sl']}-%{CONFIG['compliance']['max_sl']} aralığı")
-    
-    print(f"\n📂 Vardiyalar: {shift_excel}")
-    shifts = load_shifts_from_excel(shift_excel)
-    print(f"✅ {len(shifts)} vardiya yüklendi")
-    
-    print("\n⚙️ BÖLÜM 1: Interval bazlı hesaplama...")
-    interval_df = calculate_interval_requirements(df, CONFIG)
-    print(f"✅ {len(interval_df)} interval")
-    print(f"   Peak agent: {interval_df['total_agents'].max()}")
-    print(f"   Min SL: %{interval_df[['sl_a', 'sl_b']].min().min()}")
-    
-    print("\n⚙️ BÖLÜM 2: Günlük SL (takip)...")
-    daily_sl_df = calculate_daily_sl(interval_df)
-    
-    avg_daily = daily_sl_df['daily_sl_overall'].mean()
-    min_daily = daily_sl_df['daily_sl_overall'].min()
-    max_daily = daily_sl_df['daily_sl_overall'].max()
-    
-    print(f"✅ Günlük SL dağılımı:")
-    print(f"   Ortalama: %{avg_daily:.1f}")
-    print(f"   Min: %{min_daily:.1f} | Max: %{max_daily:.1f}")
-    
-    print("\n⚙️ BÖLÜM 3: Compliance Rate...")
-    compliance = calculate_compliance_rate(
-        daily_sl_df, 
-        CONFIG['compliance']['min_sl'], 
-        CONFIG['compliance']['max_sl']
+
+# ADIM 1: ErlangC ile saatlik ihtiyaç
+if verbose:
+    print("\nADIM 1: ERLANG C HESAPLAMALARI")
+    print("-" * 80)
+
+hourly_requirements = []
+erlang_details = []
+
+for hour, calls in enumerate(hourly_calls):
+    result = find_required_agents_for_asa(
+        hourly_calls=calls,
+        aht_minutes=aht_minutes,
+        target_asa_seconds=target_asa_seconds,
+        shrinkage=shrinkage
     )
-    print(f"✅ Compliance Rate: %{compliance['compliance_rate']} ({compliance['compliant_days']}/{compliance['total_days']} gün)")
-    print(f"   Hedef aralık: {compliance['target_range']}")
-    if compliance['days_below'] > 0:
-        print(f"   ⚠️ Düşük günler ({compliance['days_below']}): {[x['date'] for x in compliance['below_list']]}")
-    if compliance['days_above'] > 0:
-        print(f"   ⚠️ Yüksek günler ({compliance['days_above']}): {[x['date'] for x in compliance['above_list']]}")
     
-    print("\n⚙️ BÖLÜM 4: Aylık SL (ZORUNLU)...")
-    monthly_sl = calculate_monthly_sl(interval_df)
-    print(f"✅ Aylık SL: %{monthly_sl['overall_sl']:.1f}")
-    print(f"   {'✅ KARŞILANDI' if monthly_sl['target_met'] else '❌ KARŞILANMADI'}")
-    
-    print("\n⚙️ BÖLÜM 5: Vardiya dağıtımı...")
-    distribution_df = distribute_to_shifts(interval_df, shifts)
-    vardiya_df = aggregate_shifts(distribution_df, shifts)
-    print(f"✅ {len(vardiya_df)} vardiya-gün")
-    
+    hourly_requirements.append(result['adjusted_agents'])
+    erlang_details.append({
+        'Hour': hour,
+        'Calls': calls,
+        'Raw_Agents': result['raw_agents'],
+        'Adjusted_Agents': result['adjusted_agents'],
+        'ASA_Seconds': round(result['asa_seconds'], 2),
+        'SL_80_20': round(result['service_level_80_20'], 4),
+        'Occupancy': round(result['occupancy'], 4)
+    })
+
+erlang_df = pd.DataFrame(erlang_details)
+if verbose:
+    print(erlang_df.to_string(index=False))
+    print(f"\nSaatlik toplam: {sum(hourly_requirements)}")
+
+# ADIM 2: Linear Programming ile vardiya optimizasyonu
+if verbose:
     print("\n" + "=" * 80)
-    print("✅ TAMAMLANDI!")
-    print("=" * 80)
-    
-    return interval_df, vardiya_df, daily_sl_df, monthly_sl, compliance
+    print("ADIM 2: LINEAR PROGRAMMING ILE VARDIYA OPTIMIZASYONU")
+    print("-" * 80)
 
-
-# ============================================================================
-# KULLANIM
-# ============================================================================
-
-if __name__ == '__main__':
-    print("""
-╔════════════════════════════════════════════════════════════════╗
-║  KAPASİTE PLANLAMA SİSTEMİ - V2                               ║
-╚════════════════════════════════════════════════════════════════╝
-
-KULLANIM:
-
-# SQL'den oku
-import sqlalchemy
-engine = sqlalchemy.create_engine('connection_string')
-df = pd.read_sql('SELECT date, time, queue_a, queue_b FROM forecast', engine)
-
-# VEYA Excel'den oku
-df = pd.read_excel('cagri_tahminleri.xlsx')
-
-# Hesapla
-interval_df, vardiya_df, daily_sl_df, monthly_sl, compliance = calculate_complete_planning(
-    df,
-    shift_excel='vardiyalar.xlsx'
+solver = MinRequiredResources(
+    shifts_coverage=shifts_coverage,
+    required_resources=hourly_requirements,
+    shift_costs=shift_costs,
+    max_shift_capacity=max_shift_capacity
 )
 
-# Kaydet
-interval_df.to_excel('sonuc_interval.xlsx', index=False)
-vardiya_df.to_excel('sonuc_vardiya.xlsx', index=False)
-daily_sl_df.to_excel('sonuc_gunluk_sl.xlsx', index=False)
+solution = solver.solve()
 
-print(f"Aylık SL: %{monthly_sl['overall_sl']}")
-print(f"Compliance Rate: %{compliance['compliance_rate']}")
-""")
+if solution['status'] == 'optimal':
+    if verbose:
+        print(f"\nDurum: ✓ OPTIMAL")
+        print(f"Toplam Ajan: {int(solution['total_agents'])}")
+        print(f"Tüm Kısıtlar: ✓")
+        
+        print("\nVardiya Atamaları:")
+        for shift, agents in solution['shift_assignments'].items():
+            print(f"  {shift:20s}: {int(agents):4d} ajan")
+    
+    comparison_data = []
+    for hour in range(24):
+        comparison_data.append({
+            'Hour': hour,
+            'Calls': int(hourly_calls[hour]),
+            'Required': int(hourly_requirements[hour]),
+            'Assigned': int(solution['hourly_coverage'][hour]),
+            'Diff': int(solution['hourly_difference'][hour])
+        })
+    
+    comparison_df = pd.DataFrame(comparison_data)
+    if verbose:
+        print("\n" + "=" * 80)
+        print("SAATLIK KARŞILAŞTIRMA")
+        print("-" * 80)
+        print(comparison_df.to_string(index=False))
+else:
+    if verbose:
+        print(f"\n✗ BAŞARISIZ: {solution.get('message', 'Bilinmeyen hata')}")
+    comparison_df = None
+
+if verbose:
+    print("\n" + "=" * 80)
+
+return {
+    'erlang_results': erlang_df,
+    'hourly_requirements': hourly_requirements,
+    'shift_solution': solution,
+    'comparison': comparison_df
+}
+```
+
+# ============================================================================
+
+# ÖRNEK KULLANIM
+
+# ============================================================================
+
+if **name** == “**main**”:
+
+```
+hourly_calls = [
+    100, 80, 60, 50, 60, 80,
+    150, 250, 400, 550,
+    650, 750, 800, 780,
+    700, 600, 500, 400,
+    300, 250, 200, 150,
+    120, 100
+]
+
+shifts_coverage = {
+    'Morning_06_14':   [0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0],
+    'Morning_07_15':   [0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
+    'Morning_08_16':   [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0],
+    'Afternoon_10_18': [0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0],
+    'Afternoon_12_20': [0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0],
+    'Afternoon_14_22': [0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0],
+    'Evening_16_00':   [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1],
+    'Evening_18_02':   [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1],
+    'Night_22_06':     [1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1],
+    'Night_00_08':     [1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+}
+
+shift_costs = {
+    'Morning_06_14': 1.0,
+    'Morning_07_15': 1.0,
+    'Morning_08_16': 1.0,
+    'Afternoon_10_18': 1.0,
+    'Afternoon_12_20': 1.0,
+    'Afternoon_14_22': 1.0,
+    'Evening_16_00': 1.2,
+    'Evening_18_02': 1.2,
+    'Night_22_06': 1.5,
+    'Night_00_08': 1.5,
+}
+
+results = calculate_workforce_requirements(
+    hourly_calls=hourly_calls,
+    aht_minutes=5.0,
+    shifts_coverage=shifts_coverage,
+    target_asa_seconds=30,
+    shrinkage=0.30,
+    shift_costs=shift_costs
+)
+
+# Excel export
+results['erlang_results'].to_excel('/mnt/user-data/outputs/erlang_results.xlsx', index=False)
+results['comparison'].to_excel('/mnt/user-data/outputs/shift_comparison.xlsx', index=False)
+print("\n✓ Excel dosyaları kaydedildi!")
+```
