@@ -368,8 +368,10 @@ def prepare_required_resources(interval_df):
 “””
 interval_df’i pyworkforce formatına çevir
 Her satır bir gün, her sütun bir saat (24 saat)
+Queue A ve Queue B için ayrı ayrı
 “””
-required = []
+required_a = []
+required_b = []
 
 ```
 for date in sorted(interval_df['date'].unique()):
@@ -379,78 +381,142 @@ for date in sorted(interval_df['date'].unique()):
     day_data['hour'] = day_data['time'].apply(lambda x: int(str(x).split(':')[0]))
     day_data = day_data.sort_values('hour')
     
-    # 24 saatlik dizi oluştur
-    hourly_agents = [0] * 24
+    # 24 saatlik diziler oluştur
+    hourly_agents_a = [0] * 24
+    hourly_agents_b = [0] * 24
+    
     for _, row in day_data.iterrows():
         hour = row['hour']
-        hourly_agents[hour] = int(row['total_agents'])
+        hourly_agents_a[hour] = int(row['agents_a'])
+        hourly_agents_b[hour] = int(row['agents_b'])
     
-    required.append(hourly_agents)
+    required_a.append(hourly_agents_a)
+    required_b.append(hourly_agents_b)
 
-return required
+return required_a, required_b
 ```
 
 def optimize_shifts(interval_df, merged_shifts, config):
 “””
 pyworkforce ile vardiya optimizasyonu
+Queue A ve Queue B için ayrı ayrı optimize eder
 “””
 # Verileri hazırla
-required_resources = prepare_required_resources(interval_df)
+required_a, required_b = prepare_required_resources(interval_df)
 shifts_coverage = create_shifts_coverage(merged_shifts)
 
 ```
-num_days = len(required_resources)
+num_days = len(required_a)
 
 print(f"\n📊 Optimizasyon Verileri:")
 print(f"   Gün sayısı: {num_days}")
 print(f"   Vardiya sayısı: {len(shifts_coverage)}")
-print(f"   Günlük max ihtiyaç: {max(max(day) for day in required_resources)}")
+print(f"   Queue A günlük max: {max(max(day) for day in required_a)}")
+print(f"   Queue B günlük max: {max(max(day) for day in required_b)}")
 
-# Optimizasyonu çalıştır
+solutions = {}
+
+# Queue A için optimizasyon
+print(f"\n   🔧 Queue A optimizasyonu...")
 try:
-    scheduler = MinRequiredResources(
+    scheduler_a = MinRequiredResources(
         num_days=num_days,
         periods=24,
         shifts_coverage=shifts_coverage,
-        required_resources=required_resources,
+        required_resources=required_a,
         max_period_concurrency=config['optimization']['max_period_concurrency'],
         max_shift_concurrency=config['optimization']['max_shift_concurrency'],
         max_search_time=config['optimization']['max_search_time']
     )
-    
-    solution = scheduler.solve()
-    
-    return solution
-    
+    solutions['queue_a'] = scheduler_a.solve()
+    print(f"      ✅ Queue A: {solutions['queue_a']['status']}")
 except Exception as e:
-    print(f"❌ Optimizasyon hatası: {e}")
-    return None
+    print(f"      ❌ Queue A hatası: {e}")
+    solutions['queue_a'] = None
+
+# Queue B için optimizasyon
+print(f"   🔧 Queue B optimizasyonu...")
+try:
+    scheduler_b = MinRequiredResources(
+        num_days=num_days,
+        periods=24,
+        shifts_coverage=shifts_coverage,
+        required_resources=required_b,
+        max_period_concurrency=config['optimization']['max_period_concurrency'],
+        max_shift_concurrency=config['optimization']['max_shift_concurrency'],
+        max_search_time=config['optimization']['max_search_time']
+    )
+    solutions['queue_b'] = scheduler_b.solve()
+    print(f"      ✅ Queue B: {solutions['queue_b']['status']}")
+except Exception as e:
+    print(f"      ❌ Queue B hatası: {e}")
+    solutions['queue_b'] = None
+
+return solutions
 ```
 
-def solution_to_dataframe(solution, interval_df):
+def solution_to_dataframe(solutions, interval_df, merged_shifts):
 “””
 Optimizasyon sonucunu DataFrame’e çevir
+Shift saatleri ve ayrı queue agent sayıları ile
 “””
-if solution is None or solution[‘status’] != ‘OPTIMAL’:
-return None
+dates = sorted(interval_df[‘date’].unique())
 
 ```
-dates = sorted(interval_df['date'].unique())
+# Her iki queue için sonuçları birleştir
+results_dict = {}  # {(date, shift): {'agents_a': x, 'agents_b': y}}
 
+# Queue A sonuçları
+if solutions.get('queue_a') and solutions['queue_a']['status'] == 'OPTIMAL':
+    for item in solutions['queue_a']['resources_shifts']:
+        day_idx = item['day']
+        shift = item['shift']
+        resources = item['resources']
+        
+        date = dates[day_idx] if day_idx < len(dates) else f'Day {day_idx}'
+        key = (date, shift)
+        
+        if key not in results_dict:
+            results_dict[key] = {'agents_a': 0, 'agents_b': 0}
+        results_dict[key]['agents_a'] = resources
+
+# Queue B sonuçları
+if solutions.get('queue_b') and solutions['queue_b']['status'] == 'OPTIMAL':
+    for item in solutions['queue_b']['resources_shifts']:
+        day_idx = item['day']
+        shift = item['shift']
+        resources = item['resources']
+        
+        date = dates[day_idx] if day_idx < len(dates) else f'Day {day_idx}'
+        key = (date, shift)
+        
+        if key not in results_dict:
+            results_dict[key] = {'agents_a': 0, 'agents_b': 0}
+        results_dict[key]['agents_b'] = resources
+
+# DataFrame oluştur
 results = []
-for item in solution['resources_shifts']:
-    day_idx = item['day']
-    shift = item['shift']
-    resources = item['resources']
-    
-    if resources > 0:
+for (date, shift), agents in results_dict.items():
+    if agents['agents_a'] > 0 or agents['agents_b'] > 0:
+        # Shift saatlerini al
+        shift_times = merged_shifts.get(shift, {'start': '-', 'end': '-'})
+        
         results.append({
-            'date': dates[day_idx] if day_idx < len(dates) else f'Day {day_idx}',
+            'date': date,
             'shift': shift,
-            'agents': resources
+            'shift_hours': f"{shift_times['start']}-{shift_times['end']}",
+            'agents_a': agents['agents_a'],
+            'agents_b': agents['agents_b'],
+            'total_agents': agents['agents_a'] + agents['agents_b']
         })
 
-return pd.DataFrame(results)
+if not results:
+    return None
+
+df = pd.DataFrame(results)
+df = df.sort_values(['date', 'shift']).reset_index(drop=True)
+
+return df
 ```
 
 # ============================================================================
@@ -509,28 +575,35 @@ print(f"   ✅ Compliance Rate: %{compliance['compliance_rate']} ({compliance['c
 
 # BÖLÜM 4: Vardiya optimizasyonu
 print(f"\n🔧 BÖLÜM 4: Vardiya optimizasyonu çalışıyor...")
-solution = optimize_shifts(interval_df, merged_shifts, CONFIG)
+solutions = optimize_shifts(interval_df, merged_shifts, CONFIG)
 
-if solution and solution['status'] == 'OPTIMAL':
-    print(f"   ✅ Optimizasyon başarılı!")
-    print(f"   Toplam maliyet (agent-gün): {solution['cost']}")
+# Sonuçları kontrol et
+a_ok = solutions.get('queue_a') and solutions['queue_a']['status'] == 'OPTIMAL'
+b_ok = solutions.get('queue_b') and solutions['queue_b']['status'] == 'OPTIMAL'
+
+if a_ok and b_ok:
+    print(f"\n   ✅ Her iki queue için optimizasyon başarılı!")
+    print(f"   Queue A maliyet: {solutions['queue_a']['cost']}")
+    print(f"   Queue B maliyet: {solutions['queue_b']['cost']}")
     
-    vardiya_df = solution_to_dataframe(solution, interval_df)
+    vardiya_df = solution_to_dataframe(solutions, interval_df, merged_shifts)
     
     # Özet istatistikler
     if vardiya_df is not None and len(vardiya_df) > 0:
-        daily_total = vardiya_df.groupby('date')['agents'].sum()
+        daily_total = vardiya_df.groupby('date')['total_agents'].sum()
         print(f"   Günlük ortalama agent: {daily_total.mean():.0f}")
         print(f"   Günlük max agent: {daily_total.max()}")
 else:
-    print(f"   ❌ Optimizasyon başarısız: {solution['status'] if solution else 'Hata'}")
+    status_a = solutions['queue_a']['status'] if solutions.get('queue_a') else 'Hata'
+    status_b = solutions['queue_b']['status'] if solutions.get('queue_b') else 'Hata'
+    print(f"   ❌ Optimizasyon başarısız - Queue A: {status_a}, Queue B: {status_b}")
     vardiya_df = None
 
 print("\n" + "=" * 80)
 print("✅ TAMAMLANDI!")
 print("=" * 80)
 
-return interval_df, vardiya_df, daily_sl_df, monthly_sl, compliance, solution
+return interval_df, vardiya_df, daily_sl_df, monthly_sl, compliance, solutions
 ```
 
 # ============================================================================
@@ -547,32 +620,47 @@ return
 
 ```
 print("\n📋 VARDİYA BAZLI ÖZET:")
-print("-" * 50)
+print("-" * 60)
 
-summary = vardiya_df.groupby('shift')['agents'].agg(['mean', 'min', 'max', 'sum'])
-summary.columns = ['Ortalama', 'Min', 'Max', 'Toplam']
-summary = summary.round(0).astype(int)
+summary = vardiya_df.groupby(['shift', 'shift_hours']).agg({
+    'agents_a': ['mean', 'max'],
+    'agents_b': ['mean', 'max'],
+    'total_agents': ['mean', 'max']
+}).round(0).astype(int)
 
+summary.columns = ['A_Ort', 'A_Max', 'B_Ort', 'B_Max', 'Top_Ort', 'Top_Max']
 print(summary.to_string())
 
 print(f"\n📊 GÜNLÜK ÖZET:")
-print("-" * 50)
-daily = vardiya_df.groupby('date')['agents'].sum()
-print(f"   Ortalama: {daily.mean():.0f} agent/gün")
-print(f"   Min: {daily.min()} agent/gün")
-print(f"   Max: {daily.max()} agent/gün")
+print("-" * 60)
+daily = vardiya_df.groupby('date').agg({
+    'agents_a': 'sum',
+    'agents_b': 'sum',
+    'total_agents': 'sum'
+})
+print(f"   Queue A - Ortalama: {daily['agents_a'].mean():.0f}, Max: {daily['agents_a'].max()}")
+print(f"   Queue B - Ortalama: {daily['agents_b'].mean():.0f}, Max: {daily['agents_b'].max()}")
+print(f"   Toplam  - Ortalama: {daily['total_agents'].mean():.0f}, Max: {daily['total_agents'].max()}")
 ```
 
-def export_results(interval_df, vardiya_df, daily_sl_df, prefix=‘sonuc’):
-“”“Sonuçları Excel’e kaydet”””
-interval_df.to_excel(f’{prefix}_interval.xlsx’, index=False)
-daily_sl_df.to_excel(f’{prefix}_gunluk_sl.xlsx’, index=False)
+def export_results(interval_df, vardiya_df, daily_sl_df):
+“”“Sonuçları Excel’e kaydet - bugünün tarihi ile”””
+from datetime import datetime
 
 ```
+today = datetime.now().strftime('%Y%m%d')
+
+interval_df.to_excel(f'{today}_sonuc_interval.xlsx', index=False)
+daily_sl_df.to_excel(f'{today}_sonuc_gunluk_sl.xlsx', index=False)
+
 if vardiya_df is not None:
-    vardiya_df.to_excel(f'{prefix}_vardiya.xlsx', index=False)
+    vardiya_df.to_excel(f'{today}_sonuc_vardiya.xlsx', index=False)
 
-print(f"✅ Dosyalar kaydedildi: {prefix}_*.xlsx")
+print(f"✅ Dosyalar kaydedildi:")
+print(f"   - {today}_sonuc_interval.xlsx")
+print(f"   - {today}_sonuc_gunluk_sl.xlsx")
+if vardiya_df is not None:
+    print(f"   - {today}_sonuc_vardiya.xlsx")
 ```
 
 # ============================================================================
@@ -619,7 +707,7 @@ print_shift_summary(vardiya_df)
 
 # Kaydet
 
-export_results(interval_df, vardiya_df, daily_sl_df, prefix=‘sonuc’)
+export_results(interval_df, vardiya_df, daily_sl_df)
 
 print(f”Aylık SL: %{monthly_sl[‘overall_sl’]}”)
 print(f”Compliance Rate: %{compliance[‘compliance_rate’]}”)
